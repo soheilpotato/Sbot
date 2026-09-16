@@ -1,0 +1,9 @@
+python-telegram-bot>=21.0
+requests
+beautifulsoup4
+Flask
+python-dotenv
+groq
+google-genai
+ddgs
+edge-tts
