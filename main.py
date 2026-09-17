@@ -186,36 +186,61 @@ def run_flask():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
         [
-            InlineKeyboardButton("🤖 AI Groq", callback_data="ai_groq"),
-            InlineKeyboardButton("🤖 AI Gemini", callback_data="ai_gemini"),
+            InlineKeyboardButton(ui(context, "btn_ai_groq"), callback_data="ai_groq"),
+            InlineKeyboardButton(ui(context, "btn_ai_gemini"), callback_data="ai_gemini"),
         ],
         [
-            InlineKeyboardButton("🔎 جستجوی اینترنتی", callback_data="ai_groq_search"),
+            InlineKeyboardButton(ui(context, "btn_web_search"), callback_data="ai_groq_search"),
         ],
         [
-            InlineKeyboardButton("🌐 ترجمه چندزبانه", callback_data="ai_translate_menu"),
+            InlineKeyboardButton(ui(context, "btn_translate_menu"), callback_data="ai_translate_menu"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    greeting = "خوش آمدید! من ربات شخصی شما هستم، هرطور که مایلید ازم استفاده کنید."
-    await update.message.reply_text(greeting, reply_markup=reply_markup)
+    await update.message.reply_text(ui(context, "start_greeting"), reply_markup=reply_markup)
 
 
 # ---------------------- HELP ----------------------
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    help_text = (
-        "این کارایی هستن که از دستم برمیاد:\n\n"
-        "🤖 هوش مصنوعی (Groq یا Gemini) - چت آزاد و پاسخ به سوالات\n"
-        "🔎 جستجوی اینترنتی - برای گرفتن اطلاعات به‌روز\n"
-        "🌐 ترجمه چندزبانه - ترجمه هر متنی به هر زبونی\n"
-        "🎙️ تبدیل متن به صدا و صدا به متن\n\n"
-        "دستورات:\n"
-        "/start - نمایش منوی اصلی\n"
-        "/stop - خاموش کردن حالت هوش مصنوعی\n"
-        "/help - همین راهنما\n\n"
-        "برای شروع فقط /start رو بزن و از دکمه‌ها انتخاب کن."
-    )
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(ui(context, "help_text"))
+
+
+# ---------------------- SHARED MODE-ACTIVATION HELPERS ----------------------
+# Used by both the inline buttons (button_click) and the equivalent slash
+# commands below, so the two entry points never drift out of sync.
+def activate_groq_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    context.user_data["ai_mode"] = True
+    context.user_data["ai_provider"] = "groq"
+    context.user_data.setdefault("history_groq", [])
+    return ui(context, "mode_groq_on")
+
+
+def activate_gemini_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    context.user_data["ai_mode"] = True
+    context.user_data["ai_provider"] = "gemini"
+    context.user_data.setdefault("history_gemini", [])
+    return ui(context, "mode_gemini_on")
+
+
+def activate_search_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    context.user_data["ai_mode"] = True
+    context.user_data["ai_provider"] = "groq_search"
+    context.user_data.setdefault("history_groq_search", [])
+    return ui(context, "mode_search_on")
+
+
+def activate_translate_mode(context: ContextTypes.DEFAULT_TYPE, target: str) -> str:
+    """target can be 'auto', a known LANGUAGES code, or an arbitrary
+    free-text language name (e.g. from the /translate command) that isn't
+    in the LANGUAGES dict at all - the underlying AI translator understands
+    language names directly, so this isn't limited to the dict's contents."""
+    context.user_data["ai_mode"] = True
+    context.user_data["ai_provider"] = "translate"
+    context.user_data["translate_target"] = target
+    if target == "auto":
+        return ui(context, "translate_auto_on")
+    target_label = LANGUAGES[target]["name"] if target in LANGUAGES else target
+    return ui(context, "translate_target_on", target=target_label)
 
 
 # ---------------------- BUTTON HANDLER ----------------------
@@ -223,44 +248,42 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query = update.callback_query
     await query.answer()  # tells telegram the button press was received
 
+    if query.data == "noop":
+        return  # the page-indicator button in paginated language keyboards - does nothing
+
     if query.data == "ai_groq":
-        context.user_data["ai_mode"] = True
-        context.user_data["ai_provider"] = "groq"
-        context.user_data.setdefault("history_groq", [])  # init memory for this user/provider
-        await query.edit_message_text("حالت هوش مصنوعی (Groq) فعال شد🤖!")
+        await query.edit_message_text(activate_groq_mode(context))
 
     elif query.data == "ai_gemini":
-        context.user_data["ai_mode"] = True
-        context.user_data["ai_provider"] = "gemini"
-        context.user_data.setdefault("history_gemini", [])  # init memory for this user/provider
-        await query.edit_message_text("حالت هوش مصنوعی (Gemini) فعال شد🤖!")
+        await query.edit_message_text(activate_gemini_mode(context))
 
     elif query.data == "ai_groq_search":
-        context.user_data["ai_mode"] = True
-        context.user_data["ai_provider"] = "groq_search"
-        context.user_data.setdefault("history_groq_search", [])  # init memory for this user/provider
-        await query.edit_message_text("حالت جستجوی اینترنتی (Groq) فعال شد🔎!")
+        await query.edit_message_text(activate_search_mode(context))
 
     elif query.data == "ai_translate_menu":
         await query.edit_message_text(
-            "زبان مقصد رو انتخاب کن؛ از این به بعد هر متنی به هر زبونی بفرستی، به همون زبون ترجمه می‌کنم:",
-            reply_markup=build_translate_language_keyboard(),
+            ui(context, "translate_menu_prompt"),
+            reply_markup=build_paginated_lang_keyboard("translate_lang", page=0, include_auto=True),
         )
 
     elif query.data.startswith("translate_lang:"):
         target_code = query.data.split(":", 1)[1]
-        context.user_data["ai_mode"] = True
-        context.user_data["ai_provider"] = "translate"
-        context.user_data["translate_target"] = target_code
-        if target_code == "auto":
-            msg = "حالت ترجمه خودکار فعال شد🌐 (فارسی⇄انگلیسی). هر متنی بفرستی ترجمه می‌کنم."
-        else:
-            target_label = LANGUAGES[target_code]["label"]
-            msg = (
-                f"حالت ترجمه فعال شد🌐! هر متنی به هر زبونی بفرستی، "
-                f"به {target_label} ترجمه می‌کنم.\nبرای عوض کردن زبان مقصد دوباره /start رو بزن."
+        await query.edit_message_text(activate_translate_mode(context, target_code))
+
+    elif query.data.startswith("langpage:"):
+        # "langpage:<kind>:<page>" - flip a page of a paginated language keyboard.
+        _, kind, page_str = query.data.split(":", 2)
+        page = int(page_str)
+        if kind == "translate_lang":
+            await query.edit_message_reply_markup(
+                reply_markup=build_paginated_lang_keyboard("translate_lang", page, include_auto=True)
             )
-        await query.edit_message_text(msg)
+
+    elif query.data.startswith("ui_lang:"):
+        lang_code = query.data.split(":", 1)[1]
+        context.user_data["ui_lang"] = lang_code
+        lang_label = LANGUAGES[lang_code]["label"]
+        await query.edit_message_text(ui(context, "language_set", lang=lang_label))
 
     elif query.data.startswith("tts:"):
         await handle_tts_button(update, context)
@@ -278,7 +301,72 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------------------- STOP AI MODE (optional command) ----------------------
 async def stop_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["ai_mode"] = False
-    await update.message.reply_text("حالت هوش مصنوعی خاموش شد.")
+    await update.message.reply_text(ui(context, "stop_ai_msg"))
+
+
+# ---------------------- DIRECT MODE COMMANDS (shortcuts for the /start buttons) ----------------------
+async def groq_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(activate_groq_mode(context))
+
+
+async def gemini_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(activate_gemini_mode(context))
+
+
+async def websearch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(activate_search_mode(context))
+
+
+# ---------------------- /language COMMAND (change the bot's OWN interface language) ----------------------
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        ui(context, "language_menu_prompt"),
+        reply_markup=build_ui_language_keyboard(),
+    )
+
+
+# ---------------------- /translate COMMAND (quick one-off translation or enabling translate mode) ----------------------
+def _resolve_translate_target(raw: str) -> str:
+    """Turn a user-typed language token into either a known LANGUAGES code
+    or, if it doesn't match anything in the dict, the raw text itself (the
+    AI translator can work from a plain language name it's never seen a
+    code for, e.g. 'swahili')."""
+    lowered = raw.strip().lower()
+    if lowered in LANGUAGES:
+        return lowered
+    for code, info in LANGUAGES.items():
+        if info["name"].lower() == lowered:
+            return code
+    return raw.strip()
+
+
+async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            ui(context, "translate_menu_prompt"),
+            reply_markup=build_paginated_lang_keyboard("translate_lang", page=0, include_auto=True),
+        )
+        return
+
+    target = _resolve_translate_target(args[0])
+    remaining_text = " ".join(args[1:]).strip()
+
+    if not remaining_text:
+        # Just "/translate <lang>" - no text yet, so switch into continuous
+        # translate mode targeting that language, same as picking it from the menu.
+        await update.message.reply_text(activate_translate_mode(context, target))
+        return
+
+    # "/translate <lang> <text>" - a one-off translation, doesn't touch ai_mode/history at all.
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    try:
+        translated = await translate_text(remaining_text, target)
+    except Exception as e:
+        print(f"[translate_command] translation failed: {e}")
+        await update.message.reply_text(ui(context, "translate_fail"))
+        return
+    await send_ai_reply(update, context, translated)
 
 
 # ---------------------- FREE WEB SEARCH (DuckDuckGo, no API key, no billing) ----------------------
@@ -625,8 +713,528 @@ LANGUAGES = {
     "hi":    {"label": "🇮🇳 हिन्दी",      "name": "Hindi",      "voice": "hi-IN-SwaraNeural"},
     "ur":    {"label": "🇵🇰 اردو",       "name": "Urdu",       "voice": "ur-PK-UzmaNeural"},
     "nl":    {"label": "🇳🇱 Nederlands", "name": "Dutch",      "voice": "nl-NL-ColetteNeural"},
+    # -------- extra languages (added on top of the original 16 above) --------
+    "az":    {"label": "🇦🇿 Azərbaycan",      "name": "Azerbaijani", "voice": "az-AZ-BanuNeural"},
+    "uk":    {"label": "🇺🇦 Українська",      "name": "Ukrainian",   "voice": "uk-UA-PolinaNeural"},
+    "pl":    {"label": "🇵🇱 Polski",          "name": "Polish",      "voice": "pl-PL-ZofiaNeural"},
+    "sv":    {"label": "🇸🇪 Svenska",         "name": "Swedish",     "voice": "sv-SE-SofieNeural"},
+    "el":    {"label": "🇬🇷 Ελληνικά",        "name": "Greek",       "voice": "el-GR-AthinaNeural"},
+    "he":    {"label": "🇮🇱 עברית",          "name": "Hebrew",      "voice": "he-IL-HilaNeural"},
+    "vi":    {"label": "🇻🇳 Tiếng Việt",      "name": "Vietnamese",  "voice": "vi-VN-HoaiMyNeural"},
+    "th":    {"label": "🇹🇭 ไทย",             "name": "Thai",        "voice": "th-TH-PremwadeeNeural"},
+    "id":    {"label": "🇮🇩 Bahasa Indonesia", "name": "Indonesian", "voice": "id-ID-GadisNeural"},
+    "bn":    {"label": "🇧🇩 বাংলা",           "name": "Bengali",     "voice": "bn-BD-NabanitaNeural"},
+    "ka":    {"label": "🇬🇪 ქართული",        "name": "Georgian",    "voice": "ka-GE-EkaNeural"},
+    "kk":    {"label": "🇰🇿 Қазақша",         "name": "Kazakh",      "voice": "kk-KZ-AigulNeural"},
+    "hu":    {"label": "🇭🇺 Magyar",          "name": "Hungarian",   "voice": "hu-HU-NoemiNeural"},
+    "cs":    {"label": "🇨🇿 Čeština",         "name": "Czech",       "voice": "cs-CZ-VlastaNeural"},
+    "ro":    {"label": "🇷🇴 Română",          "name": "Romanian",    "voice": "ro-RO-AlinaNeural"},
+    "da":    {"label": "🇩🇰 Dansk",           "name": "Danish",      "voice": "da-DK-ChristelNeural"},
+    "fi":    {"label": "🇫🇮 Suomi",           "name": "Finnish",     "voice": "fi-FI-NooraNeural"},
+    "no":    {"label": "🇳🇴 Norsk",           "name": "Norwegian",   "voice": "nb-NO-PernilleNeural"},
+    "sw":    {"label": "🇰🇪 Kiswahili",       "name": "Swahili",     "voice": "sw-KE-ZuriNeural"},
+    "ms":    {"label": "🇲🇾 Bahasa Melayu",   "name": "Malay",       "voice": "ms-MY-YasminNeural"},
+    "uz":    {"label": "🇺🇿 Oʻzbekcha",       "name": "Uzbek",       "voice": "uz-UZ-MadinaNeural"},
+    "ps":    {"label": "🇦🇫 پښتو",           "name": "Pashto",      "voice": "ps-AF-LatifaNeural"},
+    "ta":    {"label": "🇮🇳 தமிழ்",           "name": "Tamil",       "voice": "ta-IN-PallaviNeural"},
+    "sr":    {"label": "🇷🇸 Српски",          "name": "Serbian",     "voice": "sr-RS-SophieNeural"},
+    "bg":    {"label": "🇧🇬 Български",       "name": "Bulgarian",   "voice": "bg-BG-KalinaNeural"},
+    "hr":    {"label": "🇭🇷 Hrvatski",        "name": "Croatian",    "voice": "hr-HR-GabrijelaNeural"},
+    "sk":    {"label": "🇸🇰 Slovenčina",      "name": "Slovak",      "voice": "sk-SK-ViktoriaNeural"},
+    "fil":   {"label": "🇵🇭 Filipino",        "name": "Filipino",    "voice": "fil-PH-BlessicaNeural"},
 }
 DEFAULT_TTS_VOICE = "en-US-AriaNeural"
+
+# The original, smaller set of languages - used for the compact "quick
+# translate" keyboard attached under every AI reply (so that keyboard stays
+# short and doesn't force the user to page through 40+ buttons just to
+# translate a single message). The full LANGUAGES dict above (all 40+) is
+# used everywhere else: the main /translate menu, language auto-detection,
+# and TTS voice picking.
+QUICK_LANGUAGES = ["fa", "en", "ar", "ja", "ko", "zh-cn", "fr", "de", "es", "ru", "tr", "it", "pt", "hi", "ur", "nl"]
+
+# The (smaller, curated) set of languages the bot's OWN interface text -
+# menus, confirmations, error messages - can be displayed in. Kept separate
+# and small on purpose: these strings are hand-translated (see UI_STRINGS
+# below), not machine-translated, so this list only grows when someone adds
+# a full translation for that language to UI_STRINGS.
+UI_LANGUAGES = ["fa", "en", "ar", "tr", "ru", "fr", "de", "es"]
+
+# ---------------------- BOT UI LANGUAGE (interface text, separate from translation) ----------------------
+# All of the bot's OWN messages (menus, confirmations, error strings) live
+# here, one full translation per supported UI language. This is separate
+# from the *translation* feature above: /translate can turn user text into
+# 40+ languages, but the bot's own buttons/menus are only fully translated
+# into the languages listed in UI_LANGUAGES, since these are hand-written,
+# not machine-translated.
+UI_STRINGS = {
+    "fa": {
+        "start_greeting": "خوش آمدید! من ربات شخصی شما هستم، هرطور که مایلید ازم استفاده کنید.",
+        "btn_ai_groq": "🤖 AI Groq",
+        "btn_ai_gemini": "🤖 AI Gemini",
+        "btn_web_search": "🔎 جستجوی اینترنتی",
+        "btn_translate_menu": "🌐 ترجمه چندزبانه",
+        "help_text": (
+            "این کارایی هستن که از دستم برمیاد:\n\n"
+            "🤖 هوش مصنوعی (Groq یا Gemini) - چت آزاد و پاسخ به سوالات\n"
+            "🔎 جستجوی اینترنتی - برای گرفتن اطلاعات به‌روز\n"
+            "🌐 ترجمه چندزبانه - ترجمه هر متنی به بیش از ۴۰ زبون\n"
+            "🎙️ تبدیل متن به صدا و صدا به متن\n\n"
+            "دستورات:\n"
+            "/start - نمایش منوی اصلی\n"
+            "/stop - خاموش کردن حالت هوش مصنوعی\n"
+            "/help - همین راهنما\n"
+            "/groq - فعال کردن مستقیم حالت Groq\n"
+            "/gemini - فعال کردن مستقیم حالت Gemini\n"
+            "/websearch - فعال کردن مستقیم حالت جستجوی اینترنتی\n"
+            "/translate [زبان] [متن] - ترجمهٔ سریع یا فعال کردن حالت ترجمه\n"
+            "/language - تغییر زبان رابط ربات\n\n"
+            "برای شروع فقط /start رو بزن و از دکمه‌ها انتخاب کن."
+        ),
+        "mode_groq_on": "حالت هوش مصنوعی (Groq) فعال شد🤖!",
+        "mode_gemini_on": "حالت هوش مصنوعی (Gemini) فعال شد🤖!",
+        "mode_search_on": "حالت جستجوی اینترنتی (Groq) فعال شد🔎!",
+        "translate_menu_prompt": "زبان مقصد رو انتخاب کن؛ از این به بعد هر متنی بفرستی، به همون زبون ترجمه می‌کنم:",
+        "translate_auto_on": "حالت ترجمه خودکار فعال شد🌐 (فارسی⇄انگلیسی). هر متنی بفرستی ترجمه می‌کنم.",
+        "translate_target_on": (
+            "حالت ترجمه فعال شد🌐! هر متنی به هر زبونی بفرستی، به {target} ترجمه می‌کنم.\n"
+            "برای عوض کردن زبان مقصد دوباره /start رو بزن یا از دستور /translate استفاده کن."
+        ),
+        "stop_ai_msg": "حالت هوش مصنوعی خاموش شد.",
+        "translate_fail": "ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن.",
+        "ai_call_fail": "یه خطا توی گرفتن جواب از هوش مصنوعی پیش اومد (ممکنه موقتی باشه). لطفاً دوباره امتحان کن.",
+        "global_error": "یه خطای غیرمنتظره پیش اومد. لطفاً دوباره امتحان کن.",
+        "msg_translate_unavailable": "این پیام دیگه برای ترجمه در دسترس نیست.",
+        "tts_unavailable": "این پیام دیگه برای تبدیل به صدا در دسترس نیست.",
+        "tts_fail": "تبدیل به صدا با خطا مواجه شد. لطفاً دوباره امتحان کن.",
+        "voice_transcribe_fail": "نتونستم صدا رو تبدیل به متن کنم. لطفاً دوباره امتحان کن یا پیامت رو تایپ کن.",
+        "voice_empty": "متنی از پیام صوتی استخراج نشد. لطفاً دوباره امتحان کن.",
+        "btn_cancel": "❌ لغو",
+        "btn_tts": "🔊 تبدیل به صدا",
+        "btn_translate": "🌐 ترجمه",
+        "btn_auto_translate": "🔄 خودکار (فارسی⇄انگلیسی)",
+        "language_menu_prompt": "زبان رابط ربات رو انتخاب کن:",
+        "language_set": "زبان رابط ربات روی {lang} تنظیم شد✅.",
+        "translate_cmd_usage": (
+            "استفاده: /translate <زبان مقصد> <متن>\n"
+            "مثال: /translate en سلام دنیا\n"
+            "یا فقط /translate en برای فعال‌کردن حالت ترجمهٔ مداوم به انگلیسی.\n"
+            "زبان مقصد می‌تونه یه کد باشه (en، fr، ja...) یا حتی اسم هر زبونی که توی لیستم نیست، "
+            "مثلاً: /translate swahili سلام."
+        ),
+    },
+    "en": {
+        "start_greeting": "Welcome! I'm your personal bot — use me however you like.",
+        "btn_ai_groq": "🤖 AI Groq",
+        "btn_ai_gemini": "🤖 AI Gemini",
+        "btn_web_search": "🔎 Web Search",
+        "btn_translate_menu": "🌐 Multilingual Translate",
+        "help_text": (
+            "Here's what I can do:\n\n"
+            "🤖 AI (Groq or Gemini) - free chat and answering questions\n"
+            "🔎 Web search - to get up-to-date information\n"
+            "🌐 Multilingual translation - translate any text into 40+ languages\n"
+            "🎙️ Text-to-speech and speech-to-text\n\n"
+            "Commands:\n"
+            "/start - show the main menu\n"
+            "/stop - turn off AI mode\n"
+            "/help - this help message\n"
+            "/groq - switch straight into Groq mode\n"
+            "/gemini - switch straight into Gemini mode\n"
+            "/websearch - switch straight into web search mode\n"
+            "/translate [language] [text] - quick translate or enable translate mode\n"
+            "/language - change the bot's interface language\n\n"
+            "To get started, just tap /start and pick from the buttons."
+        ),
+        "mode_groq_on": "AI mode (Groq) activated🤖!",
+        "mode_gemini_on": "AI mode (Gemini) activated🤖!",
+        "mode_search_on": "Web search mode (Groq) activated🔎!",
+        "translate_menu_prompt": "Pick a target language; from now on I'll translate any text you send into it:",
+        "translate_auto_on": "Auto-translate mode activated🌐 (Persian⇄English). Send any text and I'll translate it.",
+        "translate_target_on": (
+            "Translate mode activated🌐! Send text in any language and I'll translate it into {target}.\n"
+            "To change the target language, tap /start again or use the /translate command."
+        ),
+        "stop_ai_msg": "AI mode turned off.",
+        "translate_fail": "Translation failed. Please try again.",
+        "ai_call_fail": "There was an error getting a response from the AI (it might be temporary). Please try again.",
+        "global_error": "An unexpected error occurred. Please try again.",
+        "msg_translate_unavailable": "This message is no longer available for translation.",
+        "tts_unavailable": "This message is no longer available for text-to-speech.",
+        "tts_fail": "Text-to-speech failed. Please try again.",
+        "voice_transcribe_fail": "I couldn't transcribe that voice message. Please try again or type your message.",
+        "voice_empty": "No text was extracted from the voice message. Please try again.",
+        "btn_cancel": "❌ Cancel",
+        "btn_tts": "🔊 Convert to voice",
+        "btn_translate": "🌐 Translate",
+        "btn_auto_translate": "🔄 Auto (Persian⇄English)",
+        "language_menu_prompt": "Pick the bot's interface language:",
+        "language_set": "Bot interface language set to {lang}✅.",
+        "translate_cmd_usage": (
+            "Usage: /translate <target language> <text>\n"
+            "Example: /translate en سلام دنیا\n"
+            "Or just /translate en to turn on continuous translation into English.\n"
+            "The target can be a code (en, fr, ja...) or even any language name not in my list, "
+            "e.g. /translate swahili hello."
+        ),
+    },
+    "ar": {
+        "start_greeting": "مرحبًا بك! أنا بوتك الشخصي، استخدمني بأي طريقة تحب.",
+        "btn_ai_groq": "🤖 AI Groq",
+        "btn_ai_gemini": "🤖 AI Gemini",
+        "btn_web_search": "🔎 بحث في الإنترنت",
+        "btn_translate_menu": "🌐 ترجمة متعددة اللغات",
+        "help_text": (
+            "هذه هي الأشياء التي أستطيع فعلها:\n\n"
+            "🤖 الذكاء الاصطناعي (Groq أو Gemini) - محادثة حرة والإجابة على الأسئلة\n"
+            "🔎 بحث في الإنترنت - للحصول على معلومات محدثة\n"
+            "🌐 ترجمة متعددة اللغات - ترجمة أي نص إلى أكثر من ٤٠ لغة\n"
+            "🎙️ تحويل النص إلى صوت والصوت إلى نص\n\n"
+            "الأوامر:\n"
+            "/start - عرض القائمة الرئيسية\n"
+            "/stop - إيقاف وضع الذكاء الاصطناعي\n"
+            "/help - هذه المساعدة\n"
+            "/groq - تفعيل وضع Groq مباشرة\n"
+            "/gemini - تفعيل وضع Gemini مباشرة\n"
+            "/websearch - تفعيل وضع البحث في الإنترنت مباشرة\n"
+            "/translate [لغة] [نص] - ترجمة سريعة أو تفعيل وضع الترجمة\n"
+            "/language - تغيير لغة واجهة البوت\n\n"
+            "للبدء، اضغط /start فقط واختر من الأزرار."
+        ),
+        "mode_groq_on": "تم تفعيل وضع الذكاء الاصطناعي (Groq)🤖!",
+        "mode_gemini_on": "تم تفعيل وضع الذكاء الاصطناعي (Gemini)🤖!",
+        "mode_search_on": "تم تفعيل وضع البحث في الإنترنت (Groq)🔎!",
+        "translate_menu_prompt": "اختر اللغة الهدف؛ من الآن سأترجم أي نص ترسله إليها:",
+        "translate_auto_on": "تم تفعيل وضع الترجمة التلقائية🌐 (فارسي⇄إنجليزي). أرسل أي نص وسأترجمه.",
+        "translate_target_on": (
+            "تم تفعيل وضع الترجمة🌐! أرسل نصًا بأي لغة وسأترجمه إلى {target}.\n"
+            "لتغيير اللغة الهدف، اضغط /start مرة أخرى أو استخدم أمر /translate."
+        ),
+        "stop_ai_msg": "تم إيقاف وضع الذكاء الاصطناعي.",
+        "translate_fail": "فشلت الترجمة. حاول مرة أخرى من فضلك.",
+        "ai_call_fail": "حدث خطأ أثناء الحصول على رد من الذكاء الاصطناعي (قد يكون مؤقتًا). حاول مرة أخرى من فضلك.",
+        "global_error": "حدث خطأ غير متوقع. حاول مرة أخرى من فضلك.",
+        "msg_translate_unavailable": "هذه الرسالة لم تعد متاحة للترجمة.",
+        "tts_unavailable": "هذه الرسالة لم تعد متاحة للتحويل إلى صوت.",
+        "tts_fail": "فشل التحويل إلى صوت. حاول مرة أخرى من فضلك.",
+        "voice_transcribe_fail": "لم أتمكن من تحويل الرسالة الصوتية إلى نص. حاول مرة أخرى أو اكتب رسالتك.",
+        "voice_empty": "لم يتم استخراج أي نص من الرسالة الصوتية. حاول مرة أخرى من فضلك.",
+        "btn_cancel": "❌ إلغاء",
+        "btn_tts": "🔊 تحويل إلى صوت",
+        "btn_translate": "🌐 ترجمة",
+        "btn_auto_translate": "🔄 تلقائي (فارسي⇄إنجليزي)",
+        "language_menu_prompt": "اختر لغة واجهة البوت:",
+        "language_set": "تم تعيين لغة واجهة البوت إلى {lang}✅.",
+        "translate_cmd_usage": (
+            "الاستخدام: /translate <اللغة الهدف> <النص>\n"
+            "مثال: /translate en سلام دنیا\n"
+            "أو فقط /translate en لتفعيل الترجمة المستمرة إلى الإنجليزية.\n"
+            "يمكن أن تكون اللغة الهدف رمزًا (en، fr، ja...) أو حتى اسم أي لغة غير موجودة في قائمتي، "
+            "مثل /translate swahili hello."
+        ),
+    },
+    "tr": {
+        "start_greeting": "Hoş geldin! Ben senin kişisel botunum, beni istediğin gibi kullanabilirsin.",
+        "btn_ai_groq": "🤖 AI Groq",
+        "btn_ai_gemini": "🤖 AI Gemini",
+        "btn_web_search": "🔎 İnternette Arama",
+        "btn_translate_menu": "🌐 Çok Dilli Çeviri",
+        "help_text": (
+            "İşte yapabildiklerim:\n\n"
+            "🤖 Yapay zeka (Groq veya Gemini) - serbest sohbet ve soru cevaplama\n"
+            "🔎 İnternette arama - güncel bilgi almak için\n"
+            "🌐 Çok dilli çeviri - herhangi bir metni 40'tan fazla dile çevirme\n"
+            "🎙️ Metni sese, sesi metne çevirme\n\n"
+            "Komutlar:\n"
+            "/start - ana menüyü göster\n"
+            "/stop - yapay zeka modunu kapat\n"
+            "/help - bu yardım metni\n"
+            "/groq - doğrudan Groq modunu aç\n"
+            "/gemini - doğrudan Gemini modunu aç\n"
+            "/websearch - doğrudan internet arama modunu aç\n"
+            "/translate [dil] [metin] - hızlı çeviri ya da çeviri modunu aç\n"
+            "/language - botun arayüz dilini değiştir\n\n"
+            "Başlamak için sadece /start'a bas ve butonlardan seç."
+        ),
+        "mode_groq_on": "Yapay zeka modu (Groq) etkinleştirildi🤖!",
+        "mode_gemini_on": "Yapay zeka modu (Gemini) etkinleştirildi🤖!",
+        "mode_search_on": "İnternette arama modu (Groq) etkinleştirildi🔎!",
+        "translate_menu_prompt": "Hedef dili seç; bundan sonra gönderdiğin her metni o dile çeviririm:",
+        "translate_auto_on": "Otomatik çeviri modu etkinleştirildi🌐 (Farsça⇄İngilizce). Ne gönderirsen çeviririm.",
+        "translate_target_on": (
+            "Çeviri modu etkinleştirildi🌐! Hangi dilde metin gönderirsen {target} diline çeviririm.\n"
+            "Hedef dili değiştirmek için tekrar /start'a bas ya da /translate komutunu kullan."
+        ),
+        "stop_ai_msg": "Yapay zeka modu kapatıldı.",
+        "translate_fail": "Çeviri başarısız oldu. Lütfen tekrar dene.",
+        "ai_call_fail": "Yapay zekadan yanıt alırken bir hata oluştu (geçici olabilir). Lütfen tekrar dene.",
+        "global_error": "Beklenmeyen bir hata oluştu. Lütfen tekrar dene.",
+        "msg_translate_unavailable": "Bu mesaj artık çeviri için kullanılamıyor.",
+        "tts_unavailable": "Bu mesaj artık sese çevirme için kullanılamıyor.",
+        "tts_fail": "Sese çevirme başarısız oldu. Lütfen tekrar dene.",
+        "voice_transcribe_fail": "Sesli mesajı metne çeviremedim. Lütfen tekrar dene ya da mesajını yaz.",
+        "voice_empty": "Sesli mesajdan metin çıkarılamadı. Lütfen tekrar dene.",
+        "btn_cancel": "❌ İptal",
+        "btn_tts": "🔊 Sese çevir",
+        "btn_translate": "🌐 Çevir",
+        "btn_auto_translate": "🔄 Otomatik (Farsça⇄İngilizce)",
+        "language_menu_prompt": "Botun arayüz dilini seç:",
+        "language_set": "Bot arayüz dili {lang} olarak ayarlandı✅.",
+        "translate_cmd_usage": (
+            "Kullanım: /translate <hedef dil> <metin>\n"
+            "Örnek: /translate en hello world\n"
+            "Ya da sadece /translate en yazarak sürekli İngilizce çeviri modunu aç.\n"
+            "Hedef dil bir kod olabilir (en, fr, ja...) ya da listemde olmayan herhangi bir dilin adı, "
+            "örn. /translate swahili hello."
+        ),
+    },
+    "ru": {
+        "start_greeting": "Добро пожаловать! Я твой личный бот, используй меня как захочешь.",
+        "btn_ai_groq": "🤖 AI Groq",
+        "btn_ai_gemini": "🤖 AI Gemini",
+        "btn_web_search": "🔎 Поиск в интернете",
+        "btn_translate_menu": "🌐 Многоязычный перевод",
+        "help_text": (
+            "Вот что я умею:\n\n"
+            "🤖 ИИ (Groq или Gemini) - свободное общение и ответы на вопросы\n"
+            "🔎 Поиск в интернете - чтобы получать актуальную информацию\n"
+            "🌐 Многоязычный перевод - перевод любого текста на 40+ языков\n"
+            "🎙️ Преобразование текста в речь и речи в текст\n\n"
+            "Команды:\n"
+            "/start - показать главное меню\n"
+            "/stop - выключить режим ИИ\n"
+            "/help - эта справка\n"
+            "/groq - сразу включить режим Groq\n"
+            "/gemini - сразу включить режим Gemini\n"
+            "/websearch - сразу включить режим поиска в интернете\n"
+            "/translate [язык] [текст] - быстрый перевод или включение режима перевода\n"
+            "/language - сменить язык интерфейса бота\n\n"
+            "Чтобы начать, просто нажми /start и выбери кнопку."
+        ),
+        "mode_groq_on": "Режим ИИ (Groq) активирован🤖!",
+        "mode_gemini_on": "Режим ИИ (Gemini) активирован🤖!",
+        "mode_search_on": "Режим поиска в интернете (Groq) активирован🔎!",
+        "translate_menu_prompt": "Выбери целевой язык; теперь любой присланный текст я буду переводить на него:",
+        "translate_auto_on": "Режим автоперевода активирован🌐 (персидский⇄английский). Присылай любой текст, и я переведу.",
+        "translate_target_on": (
+            "Режим перевода активирован🌐! Присылай текст на любом языке, и я переведу его на {target}.\n"
+            "Чтобы сменить целевой язык, снова нажми /start или используй команду /translate."
+        ),
+        "stop_ai_msg": "Режим ИИ выключен.",
+        "translate_fail": "Перевод не удался. Попробуй ещё раз.",
+        "ai_call_fail": "Произошла ошибка при получении ответа от ИИ (возможно, временная). Попробуй ещё раз.",
+        "global_error": "Произошла непредвиденная ошибка. Попробуй ещё раз.",
+        "msg_translate_unavailable": "Это сообщение больше недоступно для перевода.",
+        "tts_unavailable": "Это сообщение больше недоступно для преобразования в голос.",
+        "tts_fail": "Не удалось преобразовать в голос. Попробуй ещё раз.",
+        "voice_transcribe_fail": "Не удалось распознать голосовое сообщение. Попробуй ещё раз или напиши текстом.",
+        "voice_empty": "Из голосового сообщения не удалось извлечь текст. Попробуй ещё раз.",
+        "btn_cancel": "❌ Отмена",
+        "btn_tts": "🔊 Преобразовать в голос",
+        "btn_translate": "🌐 Перевести",
+        "btn_auto_translate": "🔄 Авто (персидский⇄английский)",
+        "language_menu_prompt": "Выбери язык интерфейса бота:",
+        "language_set": "Язык интерфейса бота установлен на {lang}✅.",
+        "translate_cmd_usage": (
+            "Использование: /translate <целевой язык> <текст>\n"
+            "Пример: /translate en hello world\n"
+            "Или просто /translate en, чтобы включить постоянный перевод на английский.\n"
+            "Целевой язык может быть кодом (en, fr, ja...) или даже названием любого языка, "
+            "которого нет в моём списке, напр. /translate swahili hello."
+        ),
+    },
+    "fr": {
+        "start_greeting": "Bienvenue ! Je suis ton bot personnel, utilise-moi comme tu veux.",
+        "btn_ai_groq": "🤖 IA Groq",
+        "btn_ai_gemini": "🤖 IA Gemini",
+        "btn_web_search": "🔎 Recherche web",
+        "btn_translate_menu": "🌐 Traduction multilingue",
+        "help_text": (
+            "Voici ce que je peux faire :\n\n"
+            "🤖 IA (Groq ou Gemini) - discussion libre et réponses aux questions\n"
+            "🔎 Recherche web - pour obtenir des informations à jour\n"
+            "🌐 Traduction multilingue - traduire n'importe quel texte dans plus de 40 langues\n"
+            "🎙️ Conversion texte-parole et parole-texte\n\n"
+            "Commandes :\n"
+            "/start - afficher le menu principal\n"
+            "/stop - désactiver le mode IA\n"
+            "/help - cette aide\n"
+            "/groq - activer directement le mode Groq\n"
+            "/gemini - activer directement le mode Gemini\n"
+            "/websearch - activer directement le mode recherche web\n"
+            "/translate [langue] [texte] - traduction rapide ou activation du mode traduction\n"
+            "/language - changer la langue de l'interface du bot\n\n"
+            "Pour commencer, appuie sur /start et choisis un bouton."
+        ),
+        "mode_groq_on": "Mode IA (Groq) activé🤖 !",
+        "mode_gemini_on": "Mode IA (Gemini) activé🤖 !",
+        "mode_search_on": "Mode recherche web (Groq) activé🔎 !",
+        "translate_menu_prompt": "Choisis la langue cible ; à partir de maintenant je traduirai tout texte envoyé dans celle-ci :",
+        "translate_auto_on": "Mode traduction automatique activé🌐 (persan⇄anglais). Envoie n'importe quel texte et je le traduis.",
+        "translate_target_on": (
+            "Mode traduction activé🌐 ! Envoie un texte dans n'importe quelle langue et je le traduirai en {target}.\n"
+            "Pour changer la langue cible, retape /start ou utilise la commande /translate."
+        ),
+        "stop_ai_msg": "Mode IA désactivé.",
+        "translate_fail": "La traduction a échoué. Merci de réessayer.",
+        "ai_call_fail": "Une erreur est survenue en obtenant une réponse de l'IA (peut-être temporaire). Merci de réessayer.",
+        "global_error": "Une erreur inattendue est survenue. Merci de réessayer.",
+        "msg_translate_unavailable": "Ce message n'est plus disponible pour la traduction.",
+        "tts_unavailable": "Ce message n'est plus disponible pour la conversion en voix.",
+        "tts_fail": "La conversion en voix a échoué. Merci de réessayer.",
+        "voice_transcribe_fail": "Je n'ai pas pu transcrire ce message vocal. Réessaie ou tape ton message.",
+        "voice_empty": "Aucun texte n'a pu être extrait du message vocal. Merci de réessayer.",
+        "btn_cancel": "❌ Annuler",
+        "btn_tts": "🔊 Convertir en voix",
+        "btn_translate": "🌐 Traduire",
+        "btn_auto_translate": "🔄 Auto (persan⇄anglais)",
+        "language_menu_prompt": "Choisis la langue de l'interface du bot :",
+        "language_set": "Langue de l'interface réglée sur {lang}✅.",
+        "translate_cmd_usage": (
+            "Utilisation : /translate <langue cible> <texte>\n"
+            "Exemple : /translate en bonjour le monde\n"
+            "Ou juste /translate en pour activer la traduction continue vers l'anglais.\n"
+            "La langue cible peut être un code (en, fr, ja...) ou même le nom de n'importe quelle langue "
+            "absente de ma liste, par ex. /translate swahili hello."
+        ),
+    },
+    "de": {
+        "start_greeting": "Willkommen! Ich bin dein persönlicher Bot, nutze mich wie du magst.",
+        "btn_ai_groq": "🤖 KI Groq",
+        "btn_ai_gemini": "🤖 KI Gemini",
+        "btn_web_search": "🔎 Websuche",
+        "btn_translate_menu": "🌐 Mehrsprachige Übersetzung",
+        "help_text": (
+            "Das kann ich für dich tun:\n\n"
+            "🤖 KI (Groq oder Gemini) - freies Chatten und Fragen beantworten\n"
+            "🔎 Websuche - für aktuelle Informationen\n"
+            "🌐 Mehrsprachige Übersetzung - jeden Text in über 40 Sprachen übersetzen\n"
+            "🎙️ Text-zu-Sprache und Sprache-zu-Text\n\n"
+            "Befehle:\n"
+            "/start - Hauptmenü anzeigen\n"
+            "/stop - KI-Modus ausschalten\n"
+            "/help - diese Hilfe\n"
+            "/groq - direkt in den Groq-Modus wechseln\n"
+            "/gemini - direkt in den Gemini-Modus wechseln\n"
+            "/websearch - direkt in den Websuche-Modus wechseln\n"
+            "/translate [Sprache] [Text] - Schnellübersetzung oder Übersetzungsmodus aktivieren\n"
+            "/language - Bot-Oberflächensprache ändern\n\n"
+            "Um loszulegen, tippe einfach /start und wähle einen Button."
+        ),
+        "mode_groq_on": "KI-Modus (Groq) aktiviert🤖!",
+        "mode_gemini_on": "KI-Modus (Gemini) aktiviert🤖!",
+        "mode_search_on": "Websuche-Modus (Groq) aktiviert🔎!",
+        "translate_menu_prompt": "Wähle die Zielsprache; ab jetzt übersetze ich jeden gesendeten Text in diese Sprache:",
+        "translate_auto_on": "Auto-Übersetzungsmodus aktiviert🌐 (Persisch⇄Englisch). Sende einen Text und ich übersetze ihn.",
+        "translate_target_on": (
+            "Übersetzungsmodus aktiviert🌐! Sende Text in jeder Sprache und ich übersetze ihn ins {target}.\n"
+            "Um die Zielsprache zu ändern, tippe erneut /start oder nutze den Befehl /translate."
+        ),
+        "stop_ai_msg": "KI-Modus ausgeschaltet.",
+        "translate_fail": "Übersetzung fehlgeschlagen. Bitte versuche es erneut.",
+        "ai_call_fail": "Beim Abrufen einer Antwort von der KI ist ein Fehler aufgetreten (evtl. vorübergehend). Bitte versuche es erneut.",
+        "global_error": "Ein unerwarteter Fehler ist aufgetreten. Bitte versuche es erneut.",
+        "msg_translate_unavailable": "Diese Nachricht steht nicht mehr zur Übersetzung zur Verfügung.",
+        "tts_unavailable": "Diese Nachricht steht nicht mehr für die Sprachumwandlung zur Verfügung.",
+        "tts_fail": "Die Umwandlung in Sprache ist fehlgeschlagen. Bitte versuche es erneut.",
+        "voice_transcribe_fail": "Ich konnte die Sprachnachricht nicht transkribieren. Bitte versuche es erneut oder tippe deine Nachricht.",
+        "voice_empty": "Aus der Sprachnachricht konnte kein Text extrahiert werden. Bitte versuche es erneut.",
+        "btn_cancel": "❌ Abbrechen",
+        "btn_tts": "🔊 In Sprache umwandeln",
+        "btn_translate": "🌐 Übersetzen",
+        "btn_auto_translate": "🔄 Automatisch (Persisch⇄Englisch)",
+        "language_menu_prompt": "Wähle die Oberflächensprache des Bots:",
+        "language_set": "Bot-Oberflächensprache auf {lang} eingestellt✅.",
+        "translate_cmd_usage": (
+            "Verwendung: /translate <Zielsprache> <Text>\n"
+            "Beispiel: /translate en hello world\n"
+            "Oder einfach /translate en, um die fortlaufende Übersetzung ins Englische zu aktivieren.\n"
+            "Die Zielsprache kann ein Code sein (en, fr, ja...) oder sogar der Name jeder Sprache, "
+            "die nicht in meiner Liste steht, z. B. /translate swahili hello."
+        ),
+    },
+    "es": {
+        "start_greeting": "¡Bienvenido! Soy tu bot personal, úsame como quieras.",
+        "btn_ai_groq": "🤖 IA Groq",
+        "btn_ai_gemini": "🤖 IA Gemini",
+        "btn_web_search": "🔎 Búsqueda web",
+        "btn_translate_menu": "🌐 Traducción multilingüe",
+        "help_text": (
+            "Esto es lo que puedo hacer:\n\n"
+            "🤖 IA (Groq o Gemini) - chat libre y respuesta a preguntas\n"
+            "🔎 Búsqueda web - para obtener información actualizada\n"
+            "🌐 Traducción multilingüe - traducir cualquier texto a más de 40 idiomas\n"
+            "🎙️ Conversión de texto a voz y de voz a texto\n\n"
+            "Comandos:\n"
+            "/start - mostrar el menú principal\n"
+            "/stop - desactivar el modo IA\n"
+            "/help - esta ayuda\n"
+            "/groq - activar directamente el modo Groq\n"
+            "/gemini - activar directamente el modo Gemini\n"
+            "/websearch - activar directamente el modo de búsqueda web\n"
+            "/translate [idioma] [texto] - traducción rápida o activar el modo traducción\n"
+            "/language - cambiar el idioma de la interfaz del bot\n\n"
+            "Para empezar, solo pulsa /start y elige un botón."
+        ),
+        "mode_groq_on": "Modo IA (Groq) activado🤖!",
+        "mode_gemini_on": "Modo IA (Gemini) activado🤖!",
+        "mode_search_on": "Modo de búsqueda web (Groq) activado🔎!",
+        "translate_menu_prompt": "Elige el idioma de destino; a partir de ahora traduciré cualquier texto que envíes a ese idioma:",
+        "translate_auto_on": "Modo de traducción automática activado🌐 (persa⇄inglés). Envía cualquier texto y lo traduzco.",
+        "translate_target_on": (
+            "¡Modo de traducción activado🌐! Envía texto en cualquier idioma y lo traduciré al {target}.\n"
+            "Para cambiar el idioma de destino, pulsa /start de nuevo o usa el comando /translate."
+        ),
+        "stop_ai_msg": "Modo IA desactivado.",
+        "translate_fail": "La traducción falló. Por favor, inténtalo de nuevo.",
+        "ai_call_fail": "Ocurrió un error al obtener una respuesta de la IA (puede ser temporal). Por favor, inténtalo de nuevo.",
+        "global_error": "Ocurrió un error inesperado. Por favor, inténtalo de nuevo.",
+        "msg_translate_unavailable": "Este mensaje ya no está disponible para traducir.",
+        "tts_unavailable": "Este mensaje ya no está disponible para convertir a voz.",
+        "tts_fail": "La conversión a voz falló. Por favor, inténtalo de nuevo.",
+        "voice_transcribe_fail": "No pude transcribir ese mensaje de voz. Inténtalo de nuevo o escribe tu mensaje.",
+        "voice_empty": "No se pudo extraer texto del mensaje de voz. Por favor, inténtalo de nuevo.",
+        "btn_cancel": "❌ Cancelar",
+        "btn_tts": "🔊 Convertir a voz",
+        "btn_translate": "🌐 Traducir",
+        "btn_auto_translate": "🔄 Automático (persa⇄inglés)",
+        "language_menu_prompt": "Elige el idioma de la interfaz del bot:",
+        "language_set": "Idioma de la interfaz del bot configurado en {lang}✅.",
+        "translate_cmd_usage": (
+            "Uso: /translate <idioma destino> <texto>\n"
+            "Ejemplo: /translate en hello world\n"
+            "O simplemente /translate en para activar la traducción continua al inglés.\n"
+            "El idioma de destino puede ser un código (en, fr, ja...) o incluso el nombre de cualquier "
+            "idioma que no esté en mi lista, p. ej. /translate swahili hello."
+        ),
+    },
+}
+
+
+def get_ui_lang(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("ui_lang", "fa")
+
+
+def ui(context: ContextTypes.DEFAULT_TYPE, key: str, **kwargs) -> str:
+    """Look up a bot interface string in the user's chosen UI language
+    (falls back to Persian for any language/key that isn't translated)."""
+    lang = get_ui_lang(context)
+    table = UI_STRINGS.get(lang, UI_STRINGS["fa"])
+    template = table.get(key, UI_STRINGS["fa"].get(key, key))
+    return template.format(**kwargs) if kwargs else template
+
+
+def build_ui_language_keyboard() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for code in UI_LANGUAGES:
+        row.append(InlineKeyboardButton(LANGUAGES[code]["label"], callback_data=f"ui_lang:{code}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
 
 # Persian and Arabic share most of their script, which trips up both simple
 # char-range checks and langdetect. These letters exist in Persian but not in
@@ -674,16 +1282,43 @@ def _tts_voice_for_language(lang_code: str) -> str:
     return DEFAULT_TTS_VOICE
 
 
-def build_translate_language_keyboard() -> InlineKeyboardMarkup:
+LANG_PAGE_SIZE = 9  # 3 columns x 3 rows of language buttons per page
+
+
+def build_paginated_lang_keyboard(
+    callback_prefix: str, page: int = 0, include_auto: bool = False
+) -> InlineKeyboardMarkup:
+    """A language-picker keyboard that pages through the full LANGUAGES dict
+    (40+ entries) instead of dumping them all into one giant, unscrollable
+    wall of buttons. `callback_prefix` is the prefix used for each language
+    button's callback_data (e.g. "translate_lang" -> "translate_lang:en"),
+    and also identifies this keyboard in the "langpage:<prefix>:<page>"
+    pagination callback."""
+    codes = list(LANGUAGES.keys())
+    total_pages = max(1, -(-len(codes) // LANG_PAGE_SIZE))  # ceil division
+    page = max(0, min(page, total_pages - 1))
+    chunk = codes[page * LANG_PAGE_SIZE : (page + 1) * LANG_PAGE_SIZE]
+
     rows, row = [], []
-    for code, info in LANGUAGES.items():
-        row.append(InlineKeyboardButton(info["label"], callback_data=f"translate_lang:{code}"))
+    for code in chunk:
+        row.append(InlineKeyboardButton(LANGUAGES[code]["label"], callback_data=f"{callback_prefix}:{code}"))
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("🔄 خودکار (فارسی⇄انگلیسی)", callback_data="translate_lang:auto")])
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"langpage:{callback_prefix}:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"langpage:{callback_prefix}:{page + 1}"))
+        rows.append(nav)
+
+    if include_auto:
+        rows.append([InlineKeyboardButton("🔄 فارسی⇄انگلیسی", callback_data=f"{callback_prefix}:auto")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -751,24 +1386,28 @@ def _remember_tts_text(context: ContextTypes.DEFAULT_TYPE, text: str, reply_to_m
     return tts_id
 
 
-def build_message_translate_keyboard(tts_id: str) -> InlineKeyboardMarkup:
+def build_message_translate_keyboard(context: ContextTypes.DEFAULT_TYPE, tts_id: str) -> InlineKeyboardMarkup:
+    # Deliberately uses the smaller QUICK_LANGUAGES list (not the full 40+ in
+    # LANGUAGES) so this keyboard, attached under every single AI reply,
+    # stays short. For the full language list, use /translate or the
+    # "🌐 Multilingual Translate" menu from /start.
     rows, row = [], []
-    for code, info in LANGUAGES.items():
-        row.append(InlineKeyboardButton(info["label"], callback_data=f"trlang:{tts_id}:{code}"))
+    for code in QUICK_LANGUAGES:
+        row.append(InlineKeyboardButton(LANGUAGES[code]["label"], callback_data=f"trlang:{tts_id}:{code}"))
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("❌ لغو", callback_data=f"trcancel:{tts_id}")])
+    rows.append([InlineKeyboardButton(ui(context, "btn_cancel"), callback_data=f"trcancel:{tts_id}")])
     return InlineKeyboardMarkup(rows)
 
 
-def build_ai_reply_keyboard(tts_id: str) -> InlineKeyboardMarkup:
+def build_ai_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, tts_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔊 تبدیل به صدا", callback_data=f"tts:{tts_id}")],
-            [InlineKeyboardButton("🌐 ترجمه", callback_data=f"trmenu:{tts_id}")],
+            [InlineKeyboardButton(ui(context, "btn_tts"), callback_data=f"tts:{tts_id}")],
+            [InlineKeyboardButton(ui(context, "btn_translate"), callback_data=f"trmenu:{tts_id}")],
         ]
     )
 
@@ -779,7 +1418,7 @@ async def send_ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, repl
     # remembered so the voice version (sent later, from a button press) can
     # still quote the same original user message.
     tts_id = _remember_tts_text(context, reply_text, update.message.message_id)
-    keyboard = build_ai_reply_keyboard(tts_id)
+    keyboard = build_ai_reply_keyboard(context, tts_id)
     await update.message.reply_text(reply_text, parse_mode=None, reply_markup=keyboard)
 
 
@@ -787,15 +1426,15 @@ async def handle_translate_menu_button(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     tts_id = query.data.split(":", 1)[1]
     if tts_id not in context.chat_data.get("tts_texts", {}):
-        await query.message.reply_text("این پیام دیگه برای ترجمه در دسترس نیست.")
+        await query.message.reply_text(ui(context, "msg_translate_unavailable"))
         return
-    await query.edit_message_reply_markup(reply_markup=build_message_translate_keyboard(tts_id))
+    await query.edit_message_reply_markup(reply_markup=build_message_translate_keyboard(context, tts_id))
 
 
 async def handle_translate_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     tts_id = query.data.split(":", 1)[1]
-    await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(tts_id))
+    await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(context, tts_id))
 
 
 async def handle_translate_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -805,8 +1444,8 @@ async def handle_translate_lang_button(update: Update, context: ContextTypes.DEF
     store = context.chat_data.get("tts_texts", {})
     entry = store.get(tts_id)
     if not entry:
-        await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(tts_id))
-        await query.message.reply_text("این پیام دیگه برای ترجمه در دسترس نیست.")
+        await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(context, tts_id))
+        await query.message.reply_text(ui(context, "msg_translate_unavailable"))
         return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
@@ -814,8 +1453,8 @@ async def handle_translate_lang_button(update: Update, context: ContextTypes.DEF
         translated = await translate_text(entry["text"], target_code)
     except Exception as e:
         print(f"[handle_translate_lang_button] translation failed: {e}")
-        await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(tts_id))
-        await query.message.reply_text("ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن.")
+        await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(context, tts_id))
+        await query.message.reply_text(ui(context, "translate_fail"))
         return
 
     # Replace the message in place with the translation, and remember the
@@ -823,7 +1462,7 @@ async def handle_translate_lang_button(update: Update, context: ContextTypes.DEF
     # same message now act on the translated version.
     entry["text"] = translated
     await query.edit_message_text(
-        translated, parse_mode=None, reply_markup=build_ai_reply_keyboard(tts_id)
+        translated, parse_mode=None, reply_markup=build_ai_reply_keyboard(context, tts_id)
     )
 
 
@@ -834,7 +1473,7 @@ async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     tts_id = query.data.split(":", 1)[1]
     entry = context.chat_data.get("tts_texts", {}).get(tts_id)
     if not entry:
-        await query.message.reply_text("این پیام دیگه برای تبدیل به صدا در دسترس نیست.")
+        await query.message.reply_text(ui(context, "tts_unavailable"))
         return
     text = entry["text"]
     reply_to_message_id = entry["reply_to_message_id"]
@@ -846,7 +1485,7 @@ async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         ogg_bytes = await synthesize_speech(text)
     except Exception as e:
         print(f"[handle_tts_button] TTS failed: {e}")
-        await query.message.reply_text("تبدیل به صدا با خطا مواجه شد. لطفاً دوباره امتحان کن.")
+        await query.message.reply_text(ui(context, "tts_fail"))
         return
 
     # "Replace" the text message with a real voice-note version of the same
@@ -896,13 +1535,11 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         user_text = await transcribe_voice(file_bytes)
     except Exception as e:
         print(f"[voice_handler] transcription failed: {e}")
-        await update.message.reply_text(
-            "نتونستم صدا رو تبدیل به متن کنم. لطفاً دوباره امتحان کن یا پیامت رو تایپ کن."
-        )
+        await update.message.reply_text(ui(context, "voice_transcribe_fail"))
         return
 
     if not user_text:
-        await update.message.reply_text("متنی از پیام صوتی استخراج نشد. لطفاً دوباره امتحان کن.")
+        await update.message.reply_text(ui(context, "voice_empty"))
         return
 
     await ai_handler(update, context, user_text)
@@ -925,10 +1562,14 @@ _AUTO_TRANSLATE_PROMPT_TEXT = (
 
 
 def build_translate_system_prompt(target_code: str) -> dict:
-    if target_code == "auto" or target_code not in LANGUAGES:
+    if not target_code or target_code == "auto":
         content = _AUTO_TRANSLATE_PROMPT_TEXT
     else:
-        target_name = LANGUAGES[target_code]["name"]
+        # target_code is either a known LANGUAGES key (e.g. "fr") or, from
+        # the /translate command, an arbitrary free-text language name the
+        # user typed that isn't in the dict at all (e.g. "Swahili") - the
+        # model understands language names directly, so both work the same way.
+        target_name = LANGUAGES[target_code]["name"] if target_code in LANGUAGES else target_code
         content = (
             "You are an expert professional translator, fluent and native-level in "
             "every major world language (Persian, English, Japanese, Arabic, Chinese, "
@@ -975,8 +1616,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
             translated = await translate_text(user_text, target_code)
         except Exception as e:
             print(f"[ai_handler] translation failed: {e}")
-            msg = "ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن."
-            await update.message.reply_text(msg)
+            await update.message.reply_text(ui(context, "translate_fail"))
             return
         await send_ai_reply(update, context, translated)
         return
@@ -1037,7 +1677,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
         try:
             reply_text = await call_gemini(messages_for_api, build_system_prompt(owner))
         except Exception as e:
-            await _handle_ai_failure(update, history, provider, e)
+            await _handle_ai_failure(update, context, history, provider, e)
             return
         assistant_role = "model"
     else:
@@ -1049,7 +1689,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
         try:
             reply_text = await run_groq_agent(history, force_search=force_search)
         except Exception as e:
-            await _handle_ai_failure(update, history, provider, e)
+            await _handle_ai_failure(update, context, history, provider, e)
             return
         assistant_role = "assistant"
 
@@ -1059,16 +1699,16 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
     await send_ai_reply(update, context, reply_text)
 
 
-async def _handle_ai_failure(update: Update, history: list, provider: str, error: Exception) -> None:
+async def _handle_ai_failure(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, history: list, provider: str, error: Exception
+) -> None:
     # Roll back the user's turn we optimistically appended before calling the
     # AI, so a failed call doesn't leave two user messages back to back in
     # the saved history (Gemini in particular expects alternating turns).
     if history and history[-1].get("role") == "user":
         history.pop()
     print(f"[ai_handler] {provider} call failed: {error}")
-    await update.message.reply_text(
-        "یه خطا توی گرفتن جواب از هوش مصنوعی پیش اومد (ممکنه موقتی باشه). لطفاً دوباره امتحان کن."
-    )
+    await update.message.reply_text(ui(context, "ai_call_fail"))
 
 
 # ---------------------- MAIN TEXT ROUTER ----------------------
@@ -1090,9 +1730,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     print(f"[global error handler] {context.error}")
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text(
-                "یه خطای غیرمنتظره پیش اومد. لطفاً دوباره امتحان کن."
-            )
+            await update.effective_message.reply_text(ui(context, "global_error"))
         except Exception:
             pass  # if we can't even send the error message, just give up quietly
 
@@ -1131,6 +1769,12 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop_ai))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("groq", groq_command))
+    app.add_handler(CommandHandler("gemini", gemini_command))
+    app.add_handler(CommandHandler("websearch", websearch_command))
+    app.add_handler(CommandHandler("translate", translate_command))
+    app.add_handler(CommandHandler("language", language_command))
+    app.add_handler(CommandHandler("lang", language_command))  # short alias
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_handler(MessageHandler(filters.VOICE, voice_handler))
