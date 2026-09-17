@@ -701,7 +701,7 @@ async def call_gemini(history: list, system_prompt: str) -> str:
 # which only covers English/Arabic, or gTTS, whose Persian voice is unreliable.
 LANGUAGES = {
     "fa":    {"label": "🇮🇷 فارسی",     "name": "Persian",    "voice": "fa-IR-DilaraNeural"},
-    "en":    {"label": "🇬🇧 English",    "name": "English",    "voice": "en-US-AnaNeural"},
+    "en":    {"label": "🇬🇧 English",    "name": "English",    "voice": "en-US-AriaNeural"},
     "ar":    {"label": "🇸🇦 العربية",    "name": "Arabic",     "voice": "ar-SA-ZariyahNeural"},
     "ja":    {"label": "🇯🇵 日本語",     "name": "Japanese",   "voice": "ja-JP-NanamiNeural"},
     "ko":    {"label": "🇰🇷 한국어",     "name": "Korean",     "voice": "ko-KR-SunHiNeural"},
@@ -746,7 +746,7 @@ LANGUAGES = {
     "sk":    {"label": "🇸🇰 Slovenčina",      "name": "Slovak",      "voice": "sk-SK-ViktoriaNeural"},
     "fil":   {"label": "🇵🇭 Filipino",        "name": "Filipino",    "voice": "fil-PH-BlessicaNeural"},
 }
-DEFAULT_TTS_VOICE = "en-US-AnaNeural"
+DEFAULT_TTS_VOICE = "en-US-AriaNeural"
 
 # The original, smaller set of languages - used for the compact "quick
 # translate" keyboard attached under every AI reply (so that keyboard stays
@@ -1338,28 +1338,8 @@ def _detect_tts_voice(text: str) -> str:
     return _tts_voice_for_language(detect_language(text))
 
 
-def _tts_style_for_voice(voice: str) -> tuple[str, str]:
-    # Voice-specific tuning is intentional: a single pitch/rate setting makes
-    # some languages sound unnaturally adult or robotic.
-    if voice == "fa-IR-DilaraNeural":
-        # Persian has only two standard Microsoft voices (Dilara/Farid), so
-        # make Dilara noticeably lighter/younger with a brighter pitch and
-        # slightly quicker delivery.
-        return "+8%", "+20Hz"
-    if voice == "en-US-AriaNeural":
-        return "+0%", "+0Hz"
-    # Leave the other language voices essentially natural.
-    return "+0%", "+0Hz"
-
-
 async def _edge_tts_mp3(text: str, voice: str) -> bytes:
-    rate, pitch = _tts_style_for_voice(voice)
-    communicate = edge_tts.Communicate(
-        text,
-        voice,
-        rate=rate,
-        pitch=pitch,
-    )
+    communicate = edge_tts.Communicate(text, voice)
     buf = io.BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
@@ -1367,7 +1347,7 @@ async def _edge_tts_mp3(text: str, voice: str) -> bytes:
     return buf.getvalue()
 
 
-def _mp3_to_ogg_opus_sync(mp3_bytes: bytes, pitch_lift: float = 1.0) -> bytes:
+def _mp3_to_ogg_opus_sync(mp3_bytes: bytes) -> bytes:
     # Telegram's round, tap-to-play voice bubble (send_voice) requires OGG
     # container + Opus codec specifically - edge-tts only gives mp3, so this
     # shells out to ffmpeg to convert. ffmpeg must be installed and on PATH.
@@ -1376,11 +1356,6 @@ def _mp3_to_ogg_opus_sync(mp3_bytes: bytes, pitch_lift: float = 1.0) -> bytes:
             "ffmpeg", "-y",
             "-i", "pipe:0",
             "-vn",
-            *(
-                ["-filter:a", f"asetrate=24000*{pitch_lift:.4f},aresample=24000,atempo={1.0/pitch_lift:.4f}"]
-                if abs(pitch_lift - 1.0) > 0.0001
-                else []
-            ),
             "-c:a", "libopus",
             "-b:a", "64k",
             "-ac", "1",
@@ -1399,14 +1374,9 @@ def _mp3_to_ogg_opus_sync(mp3_bytes: bytes, pitch_lift: float = 1.0) -> bytes:
 async def synthesize_speech(text: str) -> bytes:
     voice = _detect_tts_voice(text)
     mp3_bytes = await _edge_tts_mp3(text, voice)
-    # Persian benefits from a small additional formant-free pitch lift after
-    # synthesis. This keeps the speaking speed nearly unchanged while making
-    # Dilara less mature-sounding. English Ana already has a cute/cartoon
-    # voice profile, so it does not need this extra processing.
-    pitch_lift = 1.05 if voice == "fa-IR-DilaraNeural" else 1.0
     # ffmpeg is a blocking subprocess call, so push it to a thread like the
     # other blocking calls in this file, to avoid blocking the bot's event loop.
-    return await asyncio.to_thread(_mp3_to_ogg_opus_sync, mp3_bytes, pitch_lift)
+    return await asyncio.to_thread(_mp3_to_ogg_opus_sync, mp3_bytes)
 
 
 # In-memory store mapping a short id -> (AI reply text, the user message it
