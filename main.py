@@ -1346,10 +1346,8 @@ def _tts_style_for_voice(voice: str) -> tuple[str, str]:
         # make Dilara noticeably lighter/younger with a brighter pitch and
         # slightly quicker delivery.
         return "+8%", "+20Hz"
-    if voice == "en-US-AnaNeural":
-        # Ana is Microsoft's explicitly cute/cartoon-oriented English voice.
-        # Keep the processing gentle so she sounds young rather than squeaky.
-        return "+4%", "+10Hz"
+    if voice == "en-US-AriaNeural":
+        return "+0%", "+0Hz"
     # Leave the other language voices essentially natural.
     return "+0%", "+0Hz"
 
