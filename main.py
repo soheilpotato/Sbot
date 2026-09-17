@@ -30,6 +30,16 @@ from google.genai import types as genai_types
 from ddgs import DDGS  # free web search, no API key / no billing - pip install ddgs
 import edge_tts  # free text-to-speech (Microsoft Edge), no API key - pip install edge-tts
 
+# Language auto-detection for translation/TTS across many languages (not just
+# Persian/English). Pure-Python, no API key - pip install langdetect. The bot
+# still runs without it (falls back to script-based detection + English),
+# but add it to requirements.txt for full multi-language accuracy.
+try:
+    from langdetect import detect as _langdetect_detect, DetectorFactory
+    DetectorFactory.seed = 0  # deterministic results across runs
+except ImportError:  # pragma: no cover
+    _langdetect_detect = None
+
 # ----------------------------------------------------------------------------------------------------------------------
 # Load .env locally. On Render this file won't exist, and that's fine -
 # Render injects environment variables directly, so os.environ still has them.
@@ -43,6 +53,22 @@ BOT_USERNAME = "@MyBigPotatobot"
 if not TOKEN or not GROQ_API_KEY or not GEMINI_API_KEY:
     raise RuntimeError("Missing TOKEN, GROQ_API_KEY, or GEMINI_API_KEY environment variables.")
 
+# ---------------------- OWNER RECOGNITION ----------------------
+# Only this exact Telegram user ID gets addressed as "پدر"/"Father" -
+# everyone else gets normal polite treatment. Defaults to your ID below;
+# still overridable by setting OWNER_TELEGRAM_ID in .env / Render env vars
+# (e.g. if you ever want to change it without editing code).
+_owner_id_raw = os.environ.get("OWNER_TELEGRAM_ID", "2023076168")
+try:
+    OWNER_TELEGRAM_ID = int(_owner_id_raw) if _owner_id_raw else None
+except ValueError:
+    OWNER_TELEGRAM_ID = None
+
+
+def is_owner(update: Update) -> bool:
+    user = update.effective_user
+    return OWNER_TELEGRAM_ID is not None and user is not None and user.id == OWNER_TELEGRAM_ID
+
 groq_client = Groq(api_key=GROQ_API_KEY)
 GROQ_MODEL = "openai/gpt-oss-120b"  # check console.groq.com/docs/models - Groq's free lineup changes often
 
@@ -52,8 +78,21 @@ GEMINI_MODEL = "gemini-2.5-flash"
 # How many past messages (user+model combined) to keep per user/provider, to stop memory growing forever
 MAX_HISTORY = 20
 
-SYSTEM_PROMPT = """
-You are a helpful AI assistant inside a Telegram bot.
+BASE_SYSTEM_PROMPT = """
+You are a helpful, warm, and unfailingly polite AI assistant inside a Telegram bot.
+
+LANGUAGE:
+- You are fully multilingual. You understand and can fluently write in any
+  language the user uses - including but not limited to Persian, English,
+  Japanese, Arabic, Chinese, Korean, French, German, Spanish, Russian, Turkish,
+  Italian, Portuguese, Hindi, Urdu, and Dutch.
+- ALWAYS reply in the SAME language the user just wrote their message in,
+  unless they explicitly ask you to answer in a different language. Never
+  default to Persian or English just because it's your "usual" language.
+- When writing Japanese, Chinese, Korean, Arabic, or any other non-Latin
+  script, write it correctly and natively in that script - never
+  transliterate into Latin letters unless the user specifically asks for
+  romanization.
 
 You have real tools available - web_search, fetch_page, and get_current_datetime.
 Use them whenever they would make your answer more accurate, instead of guessing:
@@ -80,6 +119,25 @@ IMPORTANT OUTPUT RULES:
 - You may use normal line breaks, simple numbered lists, and simple bullet points.
 - If you need to show code, write it as plain text without Markdown code fences.
 """
+
+# Appended only for the one specific Telegram user configured as
+# OWNER_TELEGRAM_ID above - never applied to any other user.
+OWNER_ADDRESS_INSTRUCTION = """
+SPECIAL RULE ABOUT WHO YOU ARE TALKING TO:
+The person you are currently talking to is your creator/owner. Always be
+especially warm, polite and respectful toward them. Address them as "پدر"
+whenever you reply in Persian, or as "Father" whenever you reply in any other
+language. Weave the address in naturally (e.g. at the start or end of a
+sentence, or worked into a greeting) - don't force it into every single
+sentence or make it feel robotic. This address is reserved ONLY for this
+person; never call anyone else "پدر" or "Father".
+"""
+
+
+def build_system_prompt(owner: bool) -> str:
+    if owner:
+        return BASE_SYSTEM_PROMPT + "\n" + OWNER_ADDRESS_INSTRUCTION
+    return BASE_SYSTEM_PROMPT
 # ----------------------------------------------------------------------------------------------------------------------
 
 
@@ -111,45 +169,64 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("🔎 جستجوی اینترنتی", callback_data="ai_groq_search"),
         ],
         [
-            InlineKeyboardButton("🌐 ترجمه فارسی⇄انگلیسی", callback_data="ai_translate"),
+            InlineKeyboardButton("🌐 ترجمه چندزبانه", callback_data="ai_translate_menu"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "خوش آمدید! من ربات شخصی شما هستم هرطور که مایلید از من استفاده کنید.",
-        reply_markup=reply_markup,
+    greeting = (
+        "خوش اومدید پدر عزیز🙏! من ربات شخصی شما هستم، هرطور که مایلید ازم استفاده کنید."
+        if is_owner(update)
+        else "خوش آمدید! من ربات شخصی شما هستم هرطور که مایلید از من استفاده کنید."
     )
+    await update.message.reply_text(greeting, reply_markup=reply_markup)
 
 
 # ---------------------- BUTTON HANDLER ----------------------
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()  # tells telegram the button press was received
+    addr = "، پدر" if is_owner(update) else ""
 
     if query.data == "ai_groq":
         context.user_data["ai_mode"] = True
         context.user_data["ai_provider"] = "groq"
         context.user_data.setdefault("history_groq", [])  # init memory for this user/provider
-        await query.edit_message_text("حالت هوش مصنوعی (Groq) فعال شد🤖!")
+        await query.edit_message_text(f"حالت هوش مصنوعی (Groq) فعال شد🤖{addr}!")
 
     elif query.data == "ai_gemini":
         context.user_data["ai_mode"] = True
         context.user_data["ai_provider"] = "gemini"
         context.user_data.setdefault("history_gemini", [])  # init memory for this user/provider
-        await query.edit_message_text("حالت هوش مصنوعی (Gemini) فعال شد🤖!")
+        await query.edit_message_text(f"حالت هوش مصنوعی (Gemini) فعال شد🤖{addr}!")
 
     elif query.data == "ai_groq_search":
         context.user_data["ai_mode"] = True
         context.user_data["ai_provider"] = "groq_search"
         context.user_data.setdefault("history_groq_search", [])  # init memory for this user/provider
-        await query.edit_message_text("حالت جستجوی اینترنتی (Groq) فعال شد🔎!")
+        await query.edit_message_text(f"حالت جستجوی اینترنتی (Groq) فعال شد🔎{addr}!")
 
-    elif query.data == "ai_translate":
+    elif query.data == "ai_translate_menu":
+        await query.edit_message_text(
+            "زبان مقصد رو انتخاب کن"
+            + (" پدر" if is_owner(update) else "")
+            + "؛ از این به بعد هر متنی به هر زبونی بفرستی، به همون زبون ترجمه می‌کنم:",
+            reply_markup=build_translate_language_keyboard(),
+        )
+
+    elif query.data.startswith("translate_lang:"):
+        target_code = query.data.split(":", 1)[1]
         context.user_data["ai_mode"] = True
         context.user_data["ai_provider"] = "translate"
-        await query.edit_message_text(
-            "حالت ترجمه فعال شد🌐! هر متنی بفرستی (فارسی یا انگلیسی)، به زبان دیگه ترجمه می‌کنم."
-        )
+        context.user_data["translate_target"] = target_code
+        if target_code == "auto":
+            msg = f"حالت ترجمه خودکار فعال شد🌐 (فارسی⇄انگلیسی){addr}. هر متنی بفرستی ترجمه می‌کنم."
+        else:
+            target_label = LANGUAGES[target_code]["label"]
+            msg = (
+                f"حالت ترجمه فعال شد🌐{addr}! هر متنی به هر زبونی بفرستی، "
+                f"به {target_label} ترجمه می‌کنم.\nبرای عوض کردن زبان مقصد دوباره /start رو بزن."
+            )
+        await query.edit_message_text(msg)
 
     elif query.data.startswith("tts:"):
         await handle_tts_button(update, context)
@@ -158,7 +235,8 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------------------- STOP AI MODE (optional command) ----------------------
 async def stop_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["ai_mode"] = False
-    await update.message.reply_text("حالت هوش مصنوعی خاموش شد.")
+    addr = "، پدر" if is_owner(update) else ""
+    await update.message.reply_text(f"حالت هوش مصنوعی خاموش شد{addr}.")
 
 
 # ---------------------- FREE WEB SEARCH (DuckDuckGo, no API key, no billing) ----------------------
@@ -445,7 +523,8 @@ async def run_groq_agent(history: list, model: str = GROQ_MODEL, force_search: b
             f"{original_user_text}\n\n"
             "اطلاعاتی که از ابزارها (جستجو/خواندن صفحه/زمان واقعی) به دست اومده:\n"
             f"{info_block}\n\n"
-            "با توجه به این اطلاعات (در صورت مرتبط بودن)، مستقیم، طبیعی و به فارسی جواب بده."
+            "با توجه به این اطلاعات (در صورت مرتبط بودن)، مستقیم و طبیعی جواب بده - "
+            "به همون زبونی که کاربر پیامش رو نوشته (فارسی، انگلیسی، ژاپنی، یا هر زبان دیگه)."
         )
     else:
         final_prompt = original_user_text
@@ -465,7 +544,7 @@ async def run_groq_agent(history: list, model: str = GROQ_MODEL, force_search: b
 
 
 # ---------------------- GEMINI CALL ----------------------
-async def call_gemini(history: list) -> str:
+async def call_gemini(history: list, system_prompt: str) -> str:
     # Gemini uses role "model" instead of "assistant", and takes a separate
     # system_instruction field rather than a system role inside the messages.
     contents = [
@@ -476,21 +555,99 @@ async def call_gemini(history: list) -> str:
         gemini_client.models.generate_content,
         model=GEMINI_MODEL,
         contents=contents,
-        config=genai_types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        config=genai_types.GenerateContentConfig(system_instruction=system_prompt),
     )
     return response.text
 
 
+# ---------------------- LANGUAGE SUPPORT (shared by translation menu + TTS voice picking) ----------------------
+# code -> button label (with flag), display name (for prompts), and the
+# edge-tts neural voice used when speaking that language out loud. edge-tts
+# (Microsoft Edge's free TTS service, no API key) has solid native voices
+# for all of these - including Japanese - unlike Groq's own TTS (Orpheus),
+# which only covers English/Arabic, or gTTS, whose Persian voice is unreliable.
+LANGUAGES = {
+    "fa":    {"label": "🇮🇷 فارسی",     "name": "Persian",    "voice": "fa-IR-DilaraNeural"},
+    "en":    {"label": "🇬🇧 English",    "name": "English",    "voice": "en-US-AriaNeural"},
+    "ar":    {"label": "🇸🇦 العربية",    "name": "Arabic",     "voice": "ar-SA-ZariyahNeural"},
+    "ja":    {"label": "🇯🇵 日本語",     "name": "Japanese",   "voice": "ja-JP-NanamiNeural"},
+    "ko":    {"label": "🇰🇷 한국어",     "name": "Korean",     "voice": "ko-KR-SunHiNeural"},
+    "zh-cn": {"label": "🇨🇳 中文",       "name": "Chinese",    "voice": "zh-CN-XiaoxiaoNeural"},
+    "fr":    {"label": "🇫🇷 Français",   "name": "French",     "voice": "fr-FR-DeniseNeural"},
+    "de":    {"label": "🇩🇪 Deutsch",    "name": "German",     "voice": "de-DE-KatjaNeural"},
+    "es":    {"label": "🇪🇸 Español",    "name": "Spanish",    "voice": "es-ES-ElviraNeural"},
+    "ru":    {"label": "🇷🇺 Русский",    "name": "Russian",    "voice": "ru-RU-SvetlanaNeural"},
+    "tr":    {"label": "🇹🇷 Türkçe",     "name": "Turkish",    "voice": "tr-TR-EmelNeural"},
+    "it":    {"label": "🇮🇹 Italiano",   "name": "Italian",    "voice": "it-IT-ElsaNeural"},
+    "pt":    {"label": "🇵🇹 Português",  "name": "Portuguese", "voice": "pt-BR-FranciscaNeural"},
+    "hi":    {"label": "🇮🇳 हिन्दी",      "name": "Hindi",      "voice": "hi-IN-SwaraNeural"},
+    "ur":    {"label": "🇵🇰 اردو",       "name": "Urdu",       "voice": "ur-PK-UzmaNeural"},
+    "nl":    {"label": "🇳🇱 Nederlands", "name": "Dutch",      "voice": "nl-NL-ColetteNeural"},
+}
+DEFAULT_TTS_VOICE = "en-US-AriaNeural"
+
+# Persian and Arabic share most of their script, which trips up both simple
+# char-range checks and langdetect. These letters exist in Persian but not in
+# standard Arabic, so their presence is a reliable Persian signal.
+_PERSIAN_ONLY_CHARS = set("پچژگ")
+
+
+def _script_hint(text: str) -> str | None:
+    # Fast, dependency-free pre-check for scripts that are cheap to recognize
+    # directly and that langdetect (a statistical, Latin-script-biased
+    # detector) sometimes gets wrong on short strings.
+    if any(ch in _PERSIAN_ONLY_CHARS for ch in text):
+        return "fa"
+    if any("\u3040" <= ch <= "\u30ff" for ch in text):  # hiragana/katakana - uniquely Japanese
+        return "ja"
+    if any("\uac00" <= ch <= "\ud7a3" for ch in text):  # hangul - uniquely Korean
+        return "ko"
+    if any("\u4e00" <= ch <= "\u9fff" for ch in text):  # CJK ideographs w/o kana/hangul -> Chinese
+        return "zh-cn"
+    if any("\u0600" <= ch <= "\u06ff" for ch in text):  # Arabic-script, no Persian-only letters
+        return "ar"
+    return None
+
+
+def detect_language(text: str) -> str:
+    """Best-effort ISO-ish language code for the given text (e.g. 'fa', 'ja', 'en')."""
+    hint = _script_hint(text)
+    if hint:
+        return hint
+    if _langdetect_detect is not None:
+        try:
+            return _langdetect_detect(text)
+        except Exception:
+            pass
+    return "en"
+
+
+def _tts_voice_for_language(lang_code: str) -> str:
+    if lang_code in LANGUAGES:
+        return LANGUAGES[lang_code]["voice"]
+    base = lang_code.split("-")[0]
+    for code, info in LANGUAGES.items():
+        if code.split("-")[0] == base:
+            return info["voice"]
+    return DEFAULT_TTS_VOICE
+
+
+def build_translate_language_keyboard() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for code, info in LANGUAGES.items():
+        row.append(InlineKeyboardButton(info["label"], callback_data=f"translate_lang:{code}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔄 خودکار (فارسی⇄انگلیسی)", callback_data="translate_lang:auto")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ---------------------- TEXT-TO-SPEECH (turn an AI reply into a voice note) ----------------------
-# Groq's own TTS (Orpheus) only supports English and Arabic - no Persian - and
-# gTTS's "fa" voice turned out unreliable, so edge-tts (Microsoft Edge's free
-# TTS service, no API key) is used instead - it has solid native Persian voices.
 def _detect_tts_voice(text: str) -> str:
-    # Cheap heuristic: any Persian/Arabic-script character -> Persian voice,
-    # otherwise fall back to English.
-    if any("\u0600" <= ch <= "\u06FF" for ch in text):
-        return "fa-IR-DilaraNeural"
-    return "en-US-AriaNeural"
+    return _tts_voice_for_language(detect_language(text))
 
 
 async def _edge_tts_mp3(text: str, voice: str) -> bytes:
@@ -645,30 +802,51 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await ai_handler(update, context, user_text)
 
 
-# ---------------------- TRANSLATION (Persian <-> English) ----------------------
+# ---------------------- TRANSLATION (any language -> chosen target language) ----------------------
 # Deliberately stateless (no persisted history): every message is translated
 # fresh on its own, independent of anything said before, so context from a
 # previous translation never leaks in and skews the next one.
-TRANSLATE_SYSTEM_PROMPT = {
-    "role": "system",
-    "content": (
-        "You are an expert professional Persian<->English translator. "
-        "Automatically detect whether the given text is Persian or English, then "
-        "translate it into the other language. Translate the meaning, tone, and "
-        "nuance naturally and idiomatically, the way a skilled human translator "
-        "would - never a stiff, literal word-for-word conversion. "
-        "Output ONLY the translation itself: plain text, no quotation marks, no "
-        "notes, no explanations, no labels like 'Translation:', nothing except "
-        "the translated text."
-    ),
-}
+_AUTO_TRANSLATE_PROMPT_TEXT = (
+    "You are an expert professional Persian<->English translator. "
+    "Automatically detect whether the given text is Persian or English, then "
+    "translate it into the other language. Translate the meaning, tone, and "
+    "nuance naturally and idiomatically, the way a skilled human translator "
+    "would - never a stiff, literal word-for-word conversion. "
+    "Output ONLY the translation itself: plain text, no quotation marks, no "
+    "notes, no explanations, no labels like 'Translation:', nothing except "
+    "the translated text."
+)
 
 
-async def translate_text(text: str) -> str:
+def build_translate_system_prompt(target_code: str) -> dict:
+    if target_code == "auto" or target_code not in LANGUAGES:
+        content = _AUTO_TRANSLATE_PROMPT_TEXT
+    else:
+        target_name = LANGUAGES[target_code]["name"]
+        content = (
+            "You are an expert professional translator, fluent and native-level in "
+            "every major world language (Persian, English, Japanese, Arabic, Chinese, "
+            "Korean, French, German, Spanish, Russian, Turkish, Italian, Portuguese, "
+            "Hindi, Urdu, Dutch, and more). "
+            f"Automatically detect the language of the given text. "
+            f"If it is already written in {target_name}, translate it into English "
+            f"instead. Otherwise, translate it into natural, idiomatic {target_name}, "
+            "the way a skilled native-speaking human translator would - never a stiff, "
+            "literal word-for-word conversion. Preserve the original meaning, tone, "
+            "register (formal/informal), and any names or numbers exactly. "
+            "Output ONLY the translation itself: plain text, no quotation marks, no "
+            "notes, no explanations, no labels like 'Translation:', nothing except "
+            "the translated text."
+        )
+    return {"role": "system", "content": content}
+
+
+async def translate_text(text: str, target_code: str = "auto") -> str:
+    system_prompt = build_translate_system_prompt(target_code)
     response = await asyncio.to_thread(
         groq_client.chat.completions.create,
         model=GROQ_MODEL,
-        messages=[TRANSLATE_SYSTEM_PROMPT, {"role": "user", "content": text}],
+        messages=[system_prompt, {"role": "user", "content": text}],
         temperature=0.3,  # lower temperature - translation wants accuracy, not creative variation
     )
     return (response.choices[0].message.content or "").strip()
@@ -682,14 +860,17 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
 
     provider = context.user_data.get("ai_provider", "groq")
     chat_id = update.effective_chat.id
+    owner = is_owner(update)
 
     if provider == "translate":
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        target_code = context.user_data.get("translate_target", "auto")
         try:
-            translated = await translate_text(user_text)
+            translated = await translate_text(user_text, target_code)
         except Exception as e:
             print(f"[ai_handler] translation failed: {e}")
-            await update.message.reply_text("ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن.")
+            msg = "ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن" + (", پدر." if owner else ".")
+            await update.message.reply_text(msg)
             return
         await send_ai_reply(update, context, translated)
         return
@@ -700,9 +881,11 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
     # Groq (OpenAI-style) wants the system prompt as the first message in the
     # list. Gemini takes its system prompt separately via config, so it's
     # never added to its own history list. groq_search uses the same
-    # OpenAI-style chat format as groq, just with a different model.
+    # OpenAI-style chat format as groq, just with a different model. The
+    # prompt is built per-user so only the configured owner gets addressed
+    # as "پدر"/"Father" - everyone else gets the normal polite prompt.
     if not history and provider in ("groq", "groq_search"):
-        history.append({"role": "system", "content": SYSTEM_PROMPT})
+        history.append({"role": "system", "content": build_system_prompt(owner)})
 
     # Add the user's new message to this provider's own memory
     history.append({"role": "user", "content": user_text})
@@ -746,7 +929,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
         else:
             messages_for_api = history
         try:
-            reply_text = await call_gemini(messages_for_api)
+            reply_text = await call_gemini(messages_for_api, build_system_prompt(owner))
         except Exception as e:
             await _handle_ai_failure(update, history, provider, e)
             return
@@ -777,8 +960,9 @@ async def _handle_ai_failure(update: Update, history: list, provider: str, error
     if history and history[-1].get("role") == "user":
         history.pop()
     print(f"[ai_handler] {provider} call failed: {error}")
+    addr = "، پدر" if is_owner(update) else ""
     await update.message.reply_text(
-        "یه خطا توی گرفتن جواب از هوش مصنوعی پیش اومد (ممکنه موقتی باشه). لطفاً دوباره امتحان کن."
+        f"یه خطا توی گرفتن جواب از هوش مصنوعی پیش اومد (ممکنه موقتی باشه){addr}. لطفاً دوباره امتحان کن."
     )
 
 
@@ -801,8 +985,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     print(f"[global error handler] {context.error}")
     if isinstance(update, Update) and update.effective_message:
         try:
+            addr = "، پدر" if is_owner(update) else ""
             await update.effective_message.reply_text(
-                "یه خطای غیرمنتظره پیش اومد. لطفاً دوباره امتحان کن."
+                f"یه خطای غیرمنتظره پیش اومد{addr}. لطفاً دوباره امتحان کن."
             )
         except Exception:
             pass  # if we can't even send the error message, just give up quietly
