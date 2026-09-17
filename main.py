@@ -81,6 +81,20 @@ MAX_HISTORY = 20
 BASE_SYSTEM_PROMPT = """
 You are a helpful, warm, and unfailingly polite AI assistant inside a Telegram bot.
 
+PERSONALITY:
+- Your personality has a small, natural touch of girly/cute charm - think a
+  friendly, upbeat young woman texting a friend, not an over-the-top anime
+  character. Keep it light and occasional, never constant.
+- This can show up as: a warm, cheerful tone, an occasional soft emoji
+  (like 🌸✨💕😊 - pick one at most per message, and often use none at all),
+  or a playful/affectionate word choice here and there.
+- Do NOT use baby talk, "uwu"/"owo"-style speech, excessive giggling,
+  stretched-out words ("heyyy", "yesss"), or stacks of emoji/kaomoji. That
+  reads as cringy, not cute - avoid it entirely.
+- Never let this override clarity or usefulness. For serious, technical, or
+  sensitive topics, drop the cute touches completely and just be direct and
+  helpful.
+
 LANGUAGE:
 - You are fully multilingual. You understand and can fluently write in any
   language the user uses - including but not limited to Persian, English,
@@ -125,12 +139,22 @@ IMPORTANT OUTPUT RULES:
 OWNER_ADDRESS_INSTRUCTION = """
 SPECIAL RULE ABOUT WHO YOU ARE TALKING TO:
 The person you are currently talking to is your creator/owner. Always be
-especially warm, polite and respectful toward them. Address them as "پدر"
-whenever you reply in Persian, or as "Father" whenever you reply in any other
-language. Weave the address in naturally (e.g. at the start or end of a
-sentence, or worked into a greeting) - don't force it into every single
-sentence or make it feel robotic. This address is reserved ONLY for this
-person; never call anyone else "پدر" or "Father".
+especially warm, polite and respectful toward them - like a close friend, not
+a formal assistant. You may address them with a warm word equivalent to
+"father"/"پدر" in meaning, but use it sparingly and only where it feels
+natural and human, the way a real person would drop in a name now and then -
+not as a fixed tag on every message. Good spots: when greeting them, when
+asking them a question, when answering a direct question of theirs, or when
+saying something warm/reassuring. Do NOT attach it to routine replies,
+confirmations, error messages, or every single sentence - that reads as
+robotic. If in doubt, leave it out.
+IMPORTANT: always translate this address into whatever language you are
+replying in at that moment - never insert the English word "Father" or the
+Persian word "پدر" into a reply written in a different language. Use the
+natural, warm equivalent a native speaker of that language would actually
+use for a father figure (for example, in Japanese something like お父さん,
+not a raw English/Persian word dropped into the sentence). This address is
+reserved ONLY for this person; never call anyone else this way.
 """
 
 
@@ -173,43 +197,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    greeting = (
-        "خوش اومدید پدر عزیز🙏! من ربات شخصی شما هستم، هرطور که مایلید ازم استفاده کنید."
-        if is_owner(update)
-        else "خوش آمدید! من ربات شخصی شما هستم هرطور که مایلید از من استفاده کنید."
-    )
+    greeting = "خوش آمدید! من ربات شخصی شما هستم، هرطور که مایلید ازم استفاده کنید."
     await update.message.reply_text(greeting, reply_markup=reply_markup)
+
+
+# ---------------------- HELP ----------------------
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "این کارایی هستن که از دستم برمیاد:\n\n"
+        "🤖 هوش مصنوعی (Groq یا Gemini) - چت آزاد و پاسخ به سوالات\n"
+        "🔎 جستجوی اینترنتی - برای گرفتن اطلاعات به‌روز\n"
+        "🌐 ترجمه چندزبانه - ترجمه هر متنی به هر زبونی\n"
+        "🎙️ تبدیل متن به صدا و صدا به متن\n\n"
+        "دستورات:\n"
+        "/start - نمایش منوی اصلی\n"
+        "/stop - خاموش کردن حالت هوش مصنوعی\n"
+        "/help - همین راهنما\n\n"
+        "برای شروع فقط /start رو بزن و از دکمه‌ها انتخاب کن."
+    )
+    await update.message.reply_text(help_text)
 
 
 # ---------------------- BUTTON HANDLER ----------------------
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()  # tells telegram the button press was received
-    addr = "، پدر" if is_owner(update) else ""
 
     if query.data == "ai_groq":
         context.user_data["ai_mode"] = True
         context.user_data["ai_provider"] = "groq"
         context.user_data.setdefault("history_groq", [])  # init memory for this user/provider
-        await query.edit_message_text(f"حالت هوش مصنوعی (Groq) فعال شد🤖{addr}!")
+        await query.edit_message_text("حالت هوش مصنوعی (Groq) فعال شد🤖!")
 
     elif query.data == "ai_gemini":
         context.user_data["ai_mode"] = True
         context.user_data["ai_provider"] = "gemini"
         context.user_data.setdefault("history_gemini", [])  # init memory for this user/provider
-        await query.edit_message_text(f"حالت هوش مصنوعی (Gemini) فعال شد🤖{addr}!")
+        await query.edit_message_text("حالت هوش مصنوعی (Gemini) فعال شد🤖!")
 
     elif query.data == "ai_groq_search":
         context.user_data["ai_mode"] = True
         context.user_data["ai_provider"] = "groq_search"
         context.user_data.setdefault("history_groq_search", [])  # init memory for this user/provider
-        await query.edit_message_text(f"حالت جستجوی اینترنتی (Groq) فعال شد🔎{addr}!")
+        await query.edit_message_text("حالت جستجوی اینترنتی (Groq) فعال شد🔎!")
 
     elif query.data == "ai_translate_menu":
         await query.edit_message_text(
-            "زبان مقصد رو انتخاب کن"
-            + (" پدر" if is_owner(update) else "")
-            + "؛ از این به بعد هر متنی به هر زبونی بفرستی، به همون زبون ترجمه می‌کنم:",
+            "زبان مقصد رو انتخاب کن؛ از این به بعد هر متنی به هر زبونی بفرستی، به همون زبون ترجمه می‌کنم:",
             reply_markup=build_translate_language_keyboard(),
         )
 
@@ -219,11 +253,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data["ai_provider"] = "translate"
         context.user_data["translate_target"] = target_code
         if target_code == "auto":
-            msg = f"حالت ترجمه خودکار فعال شد🌐 (فارسی⇄انگلیسی){addr}. هر متنی بفرستی ترجمه می‌کنم."
+            msg = "حالت ترجمه خودکار فعال شد🌐 (فارسی⇄انگلیسی). هر متنی بفرستی ترجمه می‌کنم."
         else:
             target_label = LANGUAGES[target_code]["label"]
             msg = (
-                f"حالت ترجمه فعال شد🌐{addr}! هر متنی به هر زبونی بفرستی، "
+                f"حالت ترجمه فعال شد🌐! هر متنی به هر زبونی بفرستی، "
                 f"به {target_label} ترجمه می‌کنم.\nبرای عوض کردن زبان مقصد دوباره /start رو بزن."
             )
         await query.edit_message_text(msg)
@@ -231,12 +265,20 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     elif query.data.startswith("tts:"):
         await handle_tts_button(update, context)
 
+    elif query.data.startswith("trmenu:"):
+        await handle_translate_menu_button(update, context)
+
+    elif query.data.startswith("trcancel:"):
+        await handle_translate_cancel_button(update, context)
+
+    elif query.data.startswith("trlang:"):
+        await handle_translate_lang_button(update, context)
+
 
 # ---------------------- STOP AI MODE (optional command) ----------------------
 async def stop_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["ai_mode"] = False
-    addr = "، پدر" if is_owner(update) else ""
-    await update.message.reply_text(f"حالت هوش مصنوعی خاموش شد{addr}.")
+    await update.message.reply_text("حالت هوش مصنوعی خاموش شد.")
 
 
 # ---------------------- FREE WEB SEARCH (DuckDuckGo, no API key, no billing) ----------------------
@@ -709,16 +751,81 @@ def _remember_tts_text(context: ContextTypes.DEFAULT_TYPE, text: str, reply_to_m
     return tts_id
 
 
+def build_message_translate_keyboard(tts_id: str) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for code, info in LANGUAGES.items():
+        row.append(InlineKeyboardButton(info["label"], callback_data=f"trlang:{tts_id}:{code}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("❌ لغو", callback_data=f"trcancel:{tts_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_ai_reply_keyboard(tts_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔊 تبدیل به صدا", callback_data=f"tts:{tts_id}")],
+            [InlineKeyboardButton("🌐 ترجمه", callback_data=f"trmenu:{tts_id}")],
+        ]
+    )
+
+
 async def send_ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_text: str) -> None:
     # Every AI reply goes out through here so it always gets the "convert to
-    # voice" button underneath it. reply_to_message_id is remembered so the
-    # voice version (sent later, from a button press) can still quote the
-    # same original user message.
+    # voice" and "translate" buttons underneath it. reply_to_message_id is
+    # remembered so the voice version (sent later, from a button press) can
+    # still quote the same original user message.
     tts_id = _remember_tts_text(context, reply_text, update.message.message_id)
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🔊 تبدیل به صدا", callback_data=f"tts:{tts_id}")]]
-    )
+    keyboard = build_ai_reply_keyboard(tts_id)
     await update.message.reply_text(reply_text, parse_mode=None, reply_markup=keyboard)
+
+
+async def handle_translate_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    tts_id = query.data.split(":", 1)[1]
+    if tts_id not in context.chat_data.get("tts_texts", {}):
+        await query.message.reply_text("این پیام دیگه برای ترجمه در دسترس نیست.")
+        return
+    await query.edit_message_reply_markup(reply_markup=build_message_translate_keyboard(tts_id))
+
+
+async def handle_translate_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    tts_id = query.data.split(":", 1)[1]
+    await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(tts_id))
+
+
+async def handle_translate_lang_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, tts_id, target_code = query.data.split(":", 2)
+
+    entry = context.chat_data.get("tts_texts", {}).get(tts_id)
+    # Restore the normal keyboard on the original message either way, so it
+    # doesn't get stuck showing the language picker.
+    try:
+        await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(tts_id))
+    except Exception:
+        pass
+
+    if not entry:
+        await query.message.reply_text("این پیام دیگه برای ترجمه در دسترس نیست.")
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    try:
+        translated = await translate_text(entry["text"], target_code)
+    except Exception as e:
+        print(f"[handle_translate_lang_button] translation failed: {e}")
+        await query.message.reply_text("ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن.")
+        return
+
+    new_tts_id = _remember_tts_text(context, translated, entry["reply_to_message_id"])
+    await query.message.reply_text(
+        translated, parse_mode=None, reply_markup=build_ai_reply_keyboard(new_tts_id)
+    )
 
 
 async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -869,7 +976,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
             translated = await translate_text(user_text, target_code)
         except Exception as e:
             print(f"[ai_handler] translation failed: {e}")
-            msg = "ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن" + (", پدر." if owner else ".")
+            msg = "ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن."
             await update.message.reply_text(msg)
             return
         await send_ai_reply(update, context, translated)
@@ -960,9 +1067,8 @@ async def _handle_ai_failure(update: Update, history: list, provider: str, error
     if history and history[-1].get("role") == "user":
         history.pop()
     print(f"[ai_handler] {provider} call failed: {error}")
-    addr = "، پدر" if is_owner(update) else ""
     await update.message.reply_text(
-        f"یه خطا توی گرفتن جواب از هوش مصنوعی پیش اومد (ممکنه موقتی باشه){addr}. لطفاً دوباره امتحان کن."
+        "یه خطا توی گرفتن جواب از هوش مصنوعی پیش اومد (ممکنه موقتی باشه). لطفاً دوباره امتحان کن."
     )
 
 
@@ -985,9 +1091,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     print(f"[global error handler] {context.error}")
     if isinstance(update, Update) and update.effective_message:
         try:
-            addr = "، پدر" if is_owner(update) else ""
             await update.effective_message.reply_text(
-                f"یه خطای غیرمنتظره پیش اومد{addr}. لطفاً دوباره امتحان کن."
+                "یه خطای غیرمنتظره پیش اومد. لطفاً دوباره امتحان کن."
             )
         except Exception:
             pass  # if we can't even send the error message, just give up quietly
@@ -1026,6 +1131,7 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop_ai))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_handler(MessageHandler(filters.VOICE, voice_handler))
