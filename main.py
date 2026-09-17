@@ -802,15 +802,10 @@ async def handle_translate_lang_button(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     _, tts_id, target_code = query.data.split(":", 2)
 
-    entry = context.chat_data.get("tts_texts", {}).get(tts_id)
-    # Restore the normal keyboard on the original message either way, so it
-    # doesn't get stuck showing the language picker.
-    try:
-        await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(tts_id))
-    except Exception:
-        pass
-
+    store = context.chat_data.get("tts_texts", {})
+    entry = store.get(tts_id)
     if not entry:
+        await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(tts_id))
         await query.message.reply_text("این پیام دیگه برای ترجمه در دسترس نیست.")
         return
 
@@ -819,12 +814,16 @@ async def handle_translate_lang_button(update: Update, context: ContextTypes.DEF
         translated = await translate_text(entry["text"], target_code)
     except Exception as e:
         print(f"[handle_translate_lang_button] translation failed: {e}")
+        await query.edit_message_reply_markup(reply_markup=build_ai_reply_keyboard(tts_id))
         await query.message.reply_text("ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن.")
         return
 
-    new_tts_id = _remember_tts_text(context, translated, entry["reply_to_message_id"])
-    await query.message.reply_text(
-        translated, parse_mode=None, reply_markup=build_ai_reply_keyboard(new_tts_id)
+    # Replace the message in place with the translation, and remember the
+    # translated text under the same id so the tts/translate buttons on this
+    # same message now act on the translated version.
+    entry["text"] = translated
+    await query.edit_message_text(
+        translated, parse_mode=None, reply_markup=build_ai_reply_keyboard(tts_id)
     )
 
 
