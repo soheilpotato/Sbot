@@ -288,6 +288,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     elif query.data.startswith("tts:"):
         await handle_tts_button(update, context)
 
+    elif query.data.startswith("ttsrestore:"):
+        await handle_tts_restore_button(update, context)
+
     elif query.data.startswith("trmenu:"):
         await handle_translate_menu_button(update, context)
 
@@ -811,6 +814,7 @@ UI_STRINGS = {
         "voice_empty": "متنی از پیام صوتی استخراج نشد. لطفاً دوباره امتحان کن.",
         "btn_cancel": "❌ لغو",
         "btn_tts": "🔊 تبدیل به صدا",
+        "btn_text": "📝 بازگرداندن متن",
         "btn_translate": "🌐 ترجمه",
         "btn_auto_translate": "🔄 خودکار (فارسی⇄انگلیسی)",
         "language_menu_prompt": "زبان رابط ربات رو انتخاب کن:",
@@ -866,6 +870,7 @@ UI_STRINGS = {
         "voice_empty": "No text was extracted from the voice message. Please try again.",
         "btn_cancel": "❌ Cancel",
         "btn_tts": "🔊 Convert to voice",
+        "btn_text": "📝 Return to text",
         "btn_translate": "🌐 Translate",
         "btn_auto_translate": "🔄 Auto (Persian⇄English)",
         "language_menu_prompt": "Pick the bot's interface language:",
@@ -921,6 +926,7 @@ UI_STRINGS = {
         "voice_empty": "لم يتم استخراج أي نص من الرسالة الصوتية. حاول مرة أخرى من فضلك.",
         "btn_cancel": "❌ إلغاء",
         "btn_tts": "🔊 تحويل إلى صوت",
+        "btn_text": "📝 إعادة النص",
         "btn_translate": "🌐 ترجمة",
         "btn_auto_translate": "🔄 تلقائي (فارسي⇄إنجليزي)",
         "language_menu_prompt": "اختر لغة واجهة البوت:",
@@ -976,6 +982,7 @@ UI_STRINGS = {
         "voice_empty": "Sesli mesajdan metin çıkarılamadı. Lütfen tekrar dene.",
         "btn_cancel": "❌ İptal",
         "btn_tts": "🔊 Sese çevir",
+        "btn_text": "📝 Metne döndür",
         "btn_translate": "🌐 Çevir",
         "btn_auto_translate": "🔄 Otomatik (Farsça⇄İngilizce)",
         "language_menu_prompt": "Botun arayüz dilini seç:",
@@ -1031,6 +1038,7 @@ UI_STRINGS = {
         "voice_empty": "Из голосового сообщения не удалось извлечь текст. Попробуй ещё раз.",
         "btn_cancel": "❌ Отмена",
         "btn_tts": "🔊 Преобразовать в голос",
+        "btn_text": "📝 Вернуть текст",
         "btn_translate": "🌐 Перевести",
         "btn_auto_translate": "🔄 Авто (персидский⇄английский)",
         "language_menu_prompt": "Выбери язык интерфейса бота:",
@@ -1086,6 +1094,7 @@ UI_STRINGS = {
         "voice_empty": "Aucun texte n'a pu être extrait du message vocal. Merci de réessayer.",
         "btn_cancel": "❌ Annuler",
         "btn_tts": "🔊 Convertir en voix",
+        "btn_text": "📝 Restaurer le texte",
         "btn_translate": "🌐 Traduire",
         "btn_auto_translate": "🔄 Auto (persan⇄anglais)",
         "language_menu_prompt": "Choisis la langue de l'interface du bot :",
@@ -1141,6 +1150,7 @@ UI_STRINGS = {
         "voice_empty": "Aus der Sprachnachricht konnte kein Text extrahiert werden. Bitte versuche es erneut.",
         "btn_cancel": "❌ Abbrechen",
         "btn_tts": "🔊 In Sprache umwandeln",
+        "btn_text": "📝 Text wiederherstellen",
         "btn_translate": "🌐 Übersetzen",
         "btn_auto_translate": "🔄 Automatisch (Persisch⇄Englisch)",
         "language_menu_prompt": "Wähle die Oberflächensprache des Bots:",
@@ -1196,6 +1206,7 @@ UI_STRINGS = {
         "voice_empty": "No se pudo extraer texto del mensaje de voz. Por favor, inténtalo de nuevo.",
         "btn_cancel": "❌ Cancelar",
         "btn_tts": "🔊 Convertir a voz",
+        "btn_text": "📝 Volver al texto",
         "btn_translate": "🌐 Traducir",
         "btn_auto_translate": "🔄 Automático (persa⇄inglés)",
         "language_menu_prompt": "Elige el idioma de la interfaz del bot:",
@@ -1412,6 +1423,14 @@ def build_ai_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, tts_id: str) -> 
     )
 
 
+def build_voice_reply_keyboard(context: ContextTypes.DEFAULT_TYPE, tts_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(ui(context, "btn_text"), callback_data=f"ttsrestore:{tts_id}")],
+        ]
+    )
+
+
 async def send_ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_text: str) -> None:
     # Every AI reply goes out through here so it always gets the "convert to
     # voice" and "translate" buttons underneath it. reply_to_message_id is
@@ -1475,10 +1494,11 @@ async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not entry:
         await query.message.reply_text(ui(context, "tts_unavailable"))
         return
+
     text = entry["text"]
     reply_to_message_id = entry["reply_to_message_id"]
-
     chat_id = update.effective_chat.id
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
 
     try:
@@ -1488,21 +1508,56 @@ async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.message.reply_text(ui(context, "tts_fail"))
         return
 
-    # "Replace" the text message with a real voice-note version of the same
-    # content, still replying to the same original user message so the
-    # conversation thread doesn't lose context.
+    # Remove the text message and replace it with the voice note.
     try:
         await query.message.delete()
     except Exception:
         pass  # message may already be gone / too old to delete - not critical
 
-    await context.bot.send_voice(
+    voice_message = await context.bot.send_voice(
         chat_id=chat_id,
         voice=io.BytesIO(ogg_bytes),
         filename="voice.ogg",
         reply_to_message_id=reply_to_message_id,
+        reply_markup=build_voice_reply_keyboard(context, tts_id),
     )
 
+    # Remember the current voice message so the "return to text" button can
+    # replace this voice note with the original/translated text.
+    entry["voice_message_id"] = voice_message.message_id
+
+
+async def handle_tts_restore_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    tts_id = query.data.split(":", 1)[1]
+    entry = context.chat_data.get("tts_texts", {}).get(tts_id)
+    if not entry:
+        await query.message.reply_text(ui(context, "tts_unavailable"))
+        return
+
+    text = entry["text"]
+    reply_to_message_id = entry["reply_to_message_id"]
+    chat_id = update.effective_chat.id
+
+    # Remove the voice message and restore the text in its place.
+    try:
+        await query.message.delete()
+    except Exception:
+        pass  # message may already be gone / too old to delete - not critical
+
+    text_message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=None,
+        reply_to_message_id=reply_to_message_id,
+        reply_markup=build_ai_reply_keyboard(context, tts_id),
+    )
+
+    # Keep track of whichever representation is currently active.
+    entry["text_message_id"] = text_message.message_id
+    entry.pop("voice_message_id", None)
 
 
 WHISPER_MODEL = "whisper-large-v3-turbo"  # fast + free-tier friendly Groq transcription model
