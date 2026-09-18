@@ -9,3 +9,4 @@ ddgs
 edge-tts
 langdetect
 pypdf
+python-telegram-bot[job-queue]
