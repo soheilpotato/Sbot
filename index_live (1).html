@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Potato AI</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Inter:wght@400;500;600&family=Vazirmatn:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#14161b;
+    --panel:#1a1d24;
+    --panel-2:#20232b;
+    --border:#2a2e38;
+    --text:#ecedee;
+    --text-dim:#9aa1b0;
+    --text-faint:#666e7f;
+    --accent:#cf9c42;
+    --accent-soft:#3a2f1c;
+    --accent-text:#1b1305;
+    --bubble-user:#2a2416;
+    --bubble-user-border:#4a3c1e;
+    --bubble-bot:#1e2128;
+    --danger:#c85a5a;
+    --radius-lg:18px;
+    --radius-md:12px;
+    --radius-sm:8px;
+    --sidebar-w:280px;
+    --font-ui:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
+    --font-brand:'Sora',var(--font-ui);
+    --font-fa:'Vazirmatn',var(--font-ui);
+    --font-mono:'JetBrains Mono',monospace;
+  }
+  :root[data-theme="light"]{
+    --bg:#f7f6f3;
+    --panel:#ffffff;
+    --panel-2:#f0efeb;
+    --border:#e4e2db;
+    --text:#20221f;
+    --text-dim:#6b6d68;
+    --text-faint:#9a9c96;
+    --accent:#b17c22;
+    --accent-soft:#f3e6c8;
+    --accent-text:#231a05;
+    --bubble-user:#f3e6c8;
+    --bubble-user-border:#e3cd8f;
+    --bubble-bot:#f0efeb;
+    --danger:#b04848;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font-family:var(--font-ui);
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  button{font-family:inherit;}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+
+  .app{display:flex;height:100dvh;width:100vw;}
+
+  /* ---------- Sidebar ---------- */
+  .sidebar{
+    width:var(--sidebar-w);flex-shrink:0;background:var(--panel);
+    border-right:1px solid var(--border);
+    display:flex;flex-direction:column;
+    transition:margin-left .28s cubic-bezier(.4,0,.2,1);
+  }
+  .sidebar-head{padding:14px 14px 10px;}
+  .brand{
+    display:flex;align-items:center;gap:9px;padding:4px 4px 14px;
+    font-family:var(--font-brand);font-weight:600;font-size:15.5px;letter-spacing:.2px;
+  }
+  .brand .mark{
+    width:28px;height:28px;border-radius:9px;background:linear-gradient(155deg,var(--accent),#8a6423);
+    display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0;
+  }
+  .new-chat-btn{
+    width:100%;display:flex;align-items:center;gap:9px;
+    background:var(--panel-2);border:1px solid var(--border);color:var(--text);
+    padding:10px 12px;border-radius:var(--radius-md);font-size:13.5px;font-weight:500;
+    cursor:pointer;transition:border-color .15s,background .15s;
+  }
+  .new-chat-btn:hover{border-color:var(--accent);background:var(--accent-soft);}
+  .new-chat-btn svg{flex-shrink:0;}
+
+  .search-wrap{padding:10px 14px;}
+  .search-box{
+    display:flex;align-items:center;gap:7px;background:var(--panel-2);
+    border:1px solid transparent;border-radius:var(--radius-sm);padding:7px 10px;
+  }
+  .search-box:focus-within{border-color:var(--accent);}
+  .search-box input{
+    background:none;border:none;outline:none;color:var(--text);font-size:13px;width:100%;
+  }
+  .search-box input::placeholder{color:var(--text-faint);}
+  .search-box svg{color:var(--text-faint);flex-shrink:0;}
+
+  .history{flex:1;overflow-y:auto;padding:4px 10px 10px;}
+  .history::-webkit-scrollbar{width:6px;}
+  .history::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+  .group-label{
+    font-size:11px;color:var(--text-faint);padding:12px 8px 5px;font-weight:500;
+  }
+  .chat-item{
+    display:flex;align-items:center;gap:8px;padding:9px 9px;border-radius:var(--radius-sm);
+    cursor:pointer;color:var(--text-dim);font-size:13.5px;position:relative;
+    transition:background .12s;
+  }
+  .chat-item:hover{background:var(--panel-2);}
+  .chat-item.active{background:var(--accent-soft);color:var(--text);}
+  .chat-item .title{
+    flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .chat-item .del{
+    opacity:0;flex-shrink:0;background:none;border:none;color:var(--text-faint);
+    cursor:pointer;padding:3px;border-radius:6px;display:flex;
+  }
+  .chat-item:hover .del{opacity:1;}
+  .chat-item .del:hover{color:var(--danger);background:rgba(200,90,90,.12);}
+  .empty-hist{padding:18px 10px;color:var(--text-faint);font-size:12.5px;line-height:1.5;}
+
+  .sidebar-foot{
+    border-top:1px solid var(--border);padding:10px;display:flex;gap:8px;
+  }
+  .foot-btn{
+    flex:1;display:flex;align-items:center;justify-content:center;gap:6px;
+    background:none;border:1px solid var(--border);color:var(--text-dim);
+    padding:8px 6px;border-radius:var(--radius-sm);font-size:12px;cursor:pointer;
+    transition:border-color .15s,color .15s;
+  }
+  .foot-btn:hover{border-color:var(--accent);color:var(--text);}
+
+  /* ---------- Backdrop (mobile) ---------- */
+  .backdrop{
+    position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:15;
+    opacity:0;pointer-events:none;transition:opacity .25s;
+  }
+  .app.sidebar-open .backdrop{opacity:1;pointer-events:auto;}
+
+  /* ---------- Main ---------- */
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative;}
+  .topbar{
+    display:flex;align-items:center;gap:10px;padding:12px 16px;
+    border-bottom:1px solid var(--border);flex-shrink:0;
+    background:var(--bg);
+  }
+  .icon-btn{
+    background:none;border:none;color:var(--text-dim);cursor:pointer;
+    width:34px;height:34px;border-radius:var(--radius-sm);display:flex;align-items:center;justify-content:center;
+    flex-shrink:0;transition:background .12s,color .12s;
+  }
+  .icon-btn:hover{background:var(--panel-2);color:var(--text);}
+  .topbar-title{
+    font-family:var(--font-brand);font-weight:600;font-size:14.5px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;
+  }
+  .topbar-sub{font-size:11.5px;color:var(--text-faint);margin-top:1px;}
+
+  .thread{
+    flex:1;overflow-y:auto;padding:18px 0 8px;
+    display:flex;flex-direction:column;
+  }
+  .thread::-webkit-scrollbar{width:8px;}
+  .thread::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+  .thread-inner{max-width:720px;margin:0 auto;width:100%;padding:0 18px;}
+
+  .welcome{
+    flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;padding:24px;gap:14px;
+  }
+  .welcome .mark-lg{
+    width:56px;height:56px;border-radius:16px;background:linear-gradient(155deg,var(--accent),#8a6423);
+    display:flex;align-items:center;justify-content:center;font-size:28px;
+  }
+  .welcome h1{font-family:var(--font-brand);font-size:20px;margin:0;font-weight:600;}
+  .welcome p{color:var(--text-dim);font-size:13.5px;max-width:340px;line-height:1.6;margin:0;}
+  .suggestions{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:480px;margin-top:6px;}
+  .sugg{
+    background:var(--panel-2);border:1px solid var(--border);color:var(--text-dim);
+    padding:9px 13px;border-radius:999px;font-size:12.5px;cursor:pointer;
+    transition:border-color .15s,color .15s;
+  }
+  .sugg:hover{border-color:var(--accent);color:var(--text);}
+
+  .msg-row{display:flex;gap:10px;margin-bottom:20px;align-items:flex-start;}
+  .msg-row.user{flex-direction:row-reverse;}
+  .avatar{
+    width:28px;height:28px;border-radius:8px;flex-shrink:0;
+    display:flex;align-items:center;justify-content:center;font-size:14px;margin-top:2px;
+  }
+  .avatar.bot{background:linear-gradient(155deg,var(--accent),#8a6423);}
+  .avatar.user{background:var(--panel-2);border:1px solid var(--border);color:var(--text-dim);font-size:11.5px;font-weight:600;}
+  .bubble-col{display:flex;flex-direction:column;max-width:78%;}
+  .msg-row.user .bubble-col{align-items:flex-end;}
+  .bubble{
+    padding:10px 14px;border-radius:var(--radius-lg);font-size:14.5px;line-height:1.6;
+    white-space:pre-wrap;word-wrap:break-word;
+  }
+  .msg-row.bot .bubble{background:var(--bubble-bot);border-top-left-radius:5px;}
+  .msg-row.user .bubble{
+    background:var(--bubble-user);border:1px solid var(--bubble-user-border);
+    border-top-right-radius:5px;
+  }
+  .bubble.farsi{font-family:var(--font-fa);}
+  .bubble code{
+    font-family:var(--font-mono);background:rgba(0,0,0,.25);padding:1.5px 5px;border-radius:4px;font-size:.9em;
+  }
+  :root[data-theme="light"] .bubble code{background:rgba(0,0,0,.06);}
+  .bubble pre{
+    font-family:var(--font-mono);background:#0d0f13;color:#dfe3ea;padding:11px 13px;border-radius:10px;
+    overflow-x:auto;font-size:12.5px;margin:8px 0;line-height:1.5;
+  }
+  :root[data-theme="light"] .bubble pre{background:#22252b;}
+  .msg-meta{font-size:10.5px;color:var(--text-faint);margin-top:5px;padding:0 3px;}
+
+  .typing{display:flex;gap:4px;padding:6px 2px;}
+  .typing span{
+    width:6px;height:6px;border-radius:50%;background:var(--text-faint);
+    animation:blink 1.3s infinite ease-in-out;
+  }
+  .typing span:nth-child(2){animation-delay:.18s;}
+  .typing span:nth-child(3){animation-delay:.36s;}
+  @keyframes blink{0%,80%,100%{opacity:.25;transform:translateY(0);}40%{opacity:1;transform:translateY(-2px);}}
+
+  /* ---------- Composer ---------- */
+  .composer-wrap{padding:10px 18px 16px;flex-shrink:0;}
+  .tool-row{
+    display:flex;gap:6px;max-width:720px;margin:0 auto 8px;overflow-x:auto;
+    scrollbar-width:none;
+  }
+  .tool-row::-webkit-scrollbar{display:none;}
+  .tool-chip{
+    display:flex;align-items:center;gap:6px;background:var(--panel-2);border:1px solid var(--border);
+    color:var(--text-dim);padding:6px 11px;border-radius:999px;font-size:12px;cursor:pointer;
+    white-space:nowrap;flex-shrink:0;transition:border-color .15s,color .15s;
+  }
+  .tool-chip:hover{border-color:var(--accent);color:var(--text);}
+  .tool-chip.selected{border-color:var(--accent);background:var(--accent-soft);color:var(--text);}
+  .composer{
+    max-width:720px;margin:0 auto;display:flex;align-items:flex-end;gap:8px;
+    background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-lg);
+    padding:8px 8px 8px 15px;transition:border-color .15s;
+  }
+  .composer:focus-within{border-color:var(--accent);}
+  .composer textarea{
+    flex:1;background:none;border:none;outline:none;resize:none;color:var(--text);
+    font-family:inherit;font-size:14.5px;line-height:1.5;max-height:160px;padding:6px 0;
+  }
+  .composer textarea::placeholder{color:var(--text-faint);}
+  .send-btn{
+    width:36px;height:36px;border-radius:11px;border:none;background:var(--accent);color:var(--accent-text);
+    display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;
+    transition:opacity .15s,transform .1s;
+  }
+  .send-btn:disabled{opacity:.35;cursor:default;}
+  .send-btn:not(:disabled):active{transform:scale(.92);}
+  .composer-hint{
+    text-align:center;font-size:10.5px;color:var(--text-faint);margin-top:8px;max-width:720px;
+    margin-left:auto;margin-right:auto;
+  }
+
+
+  .composer-tools{max-width:720px;margin:0 auto 8px;display:flex;align-items:center;gap:6px;}
+  .tool-select,.mini-btn{height:32px;border:1px solid var(--border);background:var(--panel-2);color:var(--text-dim);border-radius:9px;font:inherit;font-size:12px;}
+  .tool-select{padding:0 8px;max-width:150px;}
+  .mini-btn{padding:0 9px;cursor:pointer;white-space:nowrap;}
+  .mini-btn:hover{border-color:var(--accent);color:var(--text);}
+  .tool-row{margin:0;flex:1;max-width:none;}
+  .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:50;display:none;align-items:flex-end;justify-content:center;padding:14px;}
+  .modal-backdrop.open{display:flex;}
+  .modal{width:min(520px,100%);max-height:82vh;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:18px;box-shadow:0 18px 60px rgba(0,0,0,.35);padding:16px;}
+  .modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;}
+  .modal-title{font-size:15px;font-weight:700;color:var(--text);}
+  .close-btn{width:30px;height:30px;border:1px solid var(--border);background:var(--panel-2);color:var(--text-dim);border-radius:9px;cursor:pointer;}
+  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .field{display:flex;flex-direction:column;gap:5px;margin-bottom:10px;}
+  .field.full{grid-column:1/-1;}
+  .field label{font-size:11px;color:var(--text-dim);}
+  .field input,.field select,.field textarea{width:100%;box-sizing:border-box;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 10px;font:inherit;font-size:13px;outline:none;}
+  .field textarea{min-height:80px;resize:vertical;}
+  .field input:focus,.field select:focus,.field textarea:focus{border-color:var(--accent);}
+  .primary{border:none;background:var(--accent);color:var(--accent-text);border-radius:10px;padding:9px 13px;font-weight:600;cursor:pointer;}
+  .secondary{border:1px solid var(--border);background:var(--panel-2);color:var(--text);border-radius:10px;padding:9px 13px;cursor:pointer;}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;}
+  .setting-card{border:1px solid var(--border);background:var(--panel-2);border-radius:12px;padding:11px;margin-bottom:8px;}
+  .setting-card strong{font-size:13px;display:block;margin-bottom:4px;}
+  .setting-card small{color:var(--text-dim);font-size:11px;}
+  .option-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px;}
+  .option-btn{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:9px;border-radius:10px;text-align:left;cursor:pointer;font-size:12px;}
+  .option-btn.active{border-color:var(--accent);background:var(--accent-soft);}
+  .reminder-item{display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid var(--border);padding:9px;border-radius:10px;margin:7px 0;background:var(--panel-2);}
+  .reminder-item .when{font-size:11px;color:var(--text-dim);margin-top:2px;}
+  .danger{border:1px solid #a33;background:transparent;color:#e88;border-radius:8px;padding:6px 8px;cursor:pointer;}
+  .status-pill{font-size:10px;padding:3px 7px;border-radius:999px;background:var(--accent-soft);color:var(--text);}
+  .upload-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+  .upload-row input[type=file]{max-width:100%;font-size:11px;color:var(--text-dim);}
+  .message-images{display:flex;gap:7px;flex-wrap:wrap;margin-top:7px;}
+  .message-images img{width:120px;height:90px;object-fit:cover;border-radius:9px;border:1px solid var(--border);}
+  .audio-player{width:min(300px,100%);margin-top:7px;height:34px;}
+  .voice-btn{display:flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid var(--border);background:var(--panel-2);color:var(--text-dim);border-radius:10px;cursor:pointer;flex-shrink:0;}
+  .voice-btn.recording{border-color:var(--accent);background:var(--accent-soft);color:var(--text);}
+  @media(max-width:560px){.form-grid,.option-grid{grid-template-columns:1fr;}.tool-select{max-width:110px;}.composer-tools{gap:4px;}.tool-row{max-width:100%;}}
+
+  .toast{
+    position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(12px);
+    background:var(--panel-2);border:1px solid var(--border);color:var(--text);
+    padding:9px 16px;border-radius:999px;font-size:12.5px;z-index:40;
+    opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;
+    box-shadow:0 8px 24px rgba(0,0,0,.25);
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+
+  /* ---------- Responsive ---------- */
+  @media (max-width:820px){
+    .sidebar{
+      position:fixed;top:0;bottom:0;left:0;z-index:20;
+      margin-left:calc(-1 * var(--sidebar-w));
+      box-shadow:0 0 40px rgba(0,0,0,.35);
+    }
+    .app.sidebar-open .sidebar{margin-left:0;}
+    .desktop-only{display:none;}
+  }
+  @media (min-width:821px){
+    .mobile-only{display:none;}
+    .backdrop{display:none;}
+  }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+
+  <div class="backdrop" id="backdrop"></div>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <div class="brand"><span class="mark">🥔</span> Potato AI</div>
+      <button class="new-chat-btn" id="newChatBtn">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        New chat
+      </button>
+    </div>
+    <div class="search-wrap">
+      <div class="search-box">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input id="searchInput" type="text" placeholder="Search chats">
+      </div>
+    </div>
+    <div class="history" id="history"></div>
+    <div class="sidebar-foot">
+      <button class="foot-btn" id="themeBtn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <span id="themeLabel">Light</span>
+      </button>
+      <button class="foot-btn" id="clearBtn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6"/></svg>
+        Clear all
+      </button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <button class="icon-btn mobile-only" id="menuBtn" aria-label="Open chat list">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <div>
+        <div class="topbar-title" id="topbarTitle">New chat</div>
+        <div class="topbar-sub">🥔 MyBigPotatobot · Groq + Gemini · Live</div>
+      </div>
+      <button class="icon-btn" id="editTitleBtn" aria-label="Rename chat" title="Rename chat">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+      </button>
+    </div>
+
+    <div class="thread" id="thread">
+      <div class="thread-inner" id="threadInner"></div>
+    </div>
+
+    <div class="composer-wrap">
+      <div class="composer-tools">
+        <select class="tool-select" id="providerSelect" title="AI mode">
+          <option value="groq">🤖 Groq</option>
+          <option value="gemini">✨ Gemini</option>
+          <option value="groq_search">🔎 Web search</option>
+          <option value="groq_images">🖼️ Images</option>
+          <option value="translate">🌐 Translate</option>
+        </select>
+        <div class="tool-row" id="toolRow">
+          <button class="tool-chip" data-tool="translate">🌐 Translate</button>
+          <button class="tool-chip" data-tool="voice">🔊 Voice</button>
+          <button class="tool-chip" data-tool="remind">⏰ Reminders</button>
+          <button class="tool-chip" data-tool="personality">🎭 Personality</button>
+          <button class="tool-chip" data-tool="pdf">📄 PDF</button>
+          <button class="tool-chip" data-tool="language">🌍 UI language</button>
+          <button class="tool-chip" data-tool="ai_toggle">⏹️ Stop AI</button>
+          <button class="tool-chip" data-tool="help">❓ Help</button>
+          <button class="tool-chip" data-tool="admin" id="adminChip" style="display:none">🔐 Admin</button>
+        </div>
+      </div>
+      <div class="composer">
+        <button class="voice-btn" id="recordBtn" aria-label="Record voice" title="Record voice">🎙️</button>
+        <textarea id="composerInput" rows="1" placeholder="Message Potato AI…"></textarea>
+        <button class="send-btn" id="sendBtn" aria-label="Send">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
+        </button>
+      </div>
+      <div class="composer-hint">Connected to Potato AI · history is stored on this device</div>
+    </div>
+  </main>
+</div>
+
+
+<div class="modal-backdrop" id="modalBackdrop">
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head"><div class="modal-title" id="modalTitle">Settings</div><button class="close-btn" id="modalClose">×</button></div>
+    <div id="modalBody"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ---------- Telegram WebApp integration ---------- */
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  var root = document.documentElement;
+
+  function applyTelegramTheme(){
+    if(!tg) return;
+    var p = tg.themeParams || {};
+    if(p.bg_color) root.style.setProperty('--bg', p.bg_color);
+    if(p.secondary_bg_color) root.style.setProperty('--panel', p.secondary_bg_color);
+    if(p.text_color) root.style.setProperty('--text', p.text_color);
+    if(p.hint_color) root.style.setProperty('--text-dim', p.hint_color);
+    var scheme = tg.colorScheme === 'light' ? 'light' : 'dark';
+    root.setAttribute('data-theme', scheme);
+    themeLabel.textContent = scheme === 'light' ? 'Dark' : 'Light';
+    try{
+      tg.ready();
+      tg.expand();
+      if(tg.setHeaderColor) tg.setHeaderColor(scheme === 'light' ? '#ffffff' : '#14161b');
+    }catch(e){}
+  }
+
+  /* ---------- State ---------- */
+  var STORE_KEY = 'potato_ai_chats_v1';
+  var THEME_KEY = 'potato_ai_theme';
+  var state = { chats: [], activeId: null };
+
+  function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
+
+  function load(){
+    try{
+      var raw = localStorage.getItem(STORE_KEY);
+      if(raw) state = JSON.parse(raw);
+    }catch(e){}
+    if(!state.chats || !state.chats.length){
+      var demoId = uid();
+      state.chats = [{
+        id: demoId,
+        title: 'Welcome',
+        updatedAt: Date.now(),
+        messages: [
+          { role:'bot', text:'Hey! I\'m Potato AI 🥔 — ask me anything, or try one of the tools below the message box.', time: Date.now() }
+        ]
+      }];
+      state.activeId = demoId;
+    }
+    if(!state.activeId) state.activeId = state.chats[0].id;
+  }
+
+  function save(){
+    try{ localStorage.setItem(STORE_KEY, JSON.stringify(state)); }catch(e){}
+  }
+
+  function activeChat(){
+    return state.chats.find(function(c){ return c.id === state.activeId; });
+  }
+
+  /* ---------- DOM refs ---------- */
+  var app = document.getElementById('app');
+  var sidebar = document.getElementById('sidebar');
+  var backdrop = document.getElementById('backdrop');
+  var historyEl = document.getElementById('history');
+  var searchInput = document.getElementById('searchInput');
+  var threadInner = document.getElementById('threadInner');
+  var threadEl = document.getElementById('thread');
+  var topbarTitle = document.getElementById('topbarTitle');
+  var composerInput = document.getElementById('composerInput');
+  var sendBtn = document.getElementById('sendBtn');
+  var newChatBtn = document.getElementById('newChatBtn');
+  var menuBtn = document.getElementById('menuBtn');
+  var editTitleBtn = document.getElementById('editTitleBtn');
+  var themeBtn = document.getElementById('themeBtn');
+  var themeLabel = document.getElementById('themeLabel');
+  var clearBtn = document.getElementById('clearBtn');
+  var toast = document.getElementById('toast');
+  var toolRow = document.getElementById('toolRow');
+  var providerSelect = document.getElementById('providerSelect');
+  var recordBtn = document.getElementById('recordBtn');
+  var modalBackdrop = document.getElementById('modalBackdrop');
+  var modalTitle = document.getElementById('modalTitle');
+  var modalBody = document.getElementById('modalBody');
+  var modalClose = document.getElementById('modalClose');
+
+  /* ---------- Helpers ---------- */
+  var farsiRe = /[\u0600-\u06FF]/;
+
+  function escapeHtml(s){
+    return s.replace(/[&<>"']/g, function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+    });
+  }
+
+  function formatText(raw){
+    var text = escapeHtml(raw);
+    text = text.replace(/```([\s\S]*?)```/g, function(_, code){
+      return '<pre>' + code.trim() + '</pre>';
+    });
+    text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    return text;
+  }
+
+  function timeLabel(ts){
+    var d = new Date(ts);
+    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  }
+
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(function(){ toast.classList.remove('show'); }, 2200);
+  }
+
+  function groupLabel(ts){
+    var now = new Date(), d = new Date(ts);
+    var sameDay = now.toDateString() === d.toDateString();
+    if(sameDay) return 'Today';
+    var yest = new Date(now); yest.setDate(now.getDate()-1);
+    if(yest.toDateString() === d.toDateString()) return 'Yesterday';
+    var diffDays = Math.floor((now - d) / 86400000);
+    if(diffDays < 7) return 'Previous 7 days';
+    return 'Older';
+  }
+
+  /* ---------- Rendering ---------- */
+  function renderSidebar(){
+    var q = searchInput.value.trim().toLowerCase();
+    var sorted = state.chats.slice().sort(function(a,b){ return b.updatedAt - a.updatedAt; });
+    if(q){
+      sorted = sorted.filter(function(c){
+        return c.title.toLowerCase().indexOf(q) !== -1 ||
+          c.messages.some(function(m){ return m.text.toLowerCase().indexOf(q) !== -1; });
+      });
+    }
+    historyEl.innerHTML = '';
+    if(!sorted.length){
+      var empty = document.createElement('div');
+      empty.className = 'empty-hist';
+      empty.textContent = q ? 'No chats match your search.' : 'No conversations yet — start one below.';
+      historyEl.appendChild(empty);
+      return;
+    }
+    var lastGroup = null;
+    sorted.forEach(function(c){
+      var g = groupLabel(c.updatedAt);
+      if(g !== lastGroup){
+        var gl = document.createElement('div');
+        gl.className = 'group-label';
+        gl.textContent = g;
+        historyEl.appendChild(gl);
+        lastGroup = g;
+      }
+      var item = document.createElement('div');
+      item.className = 'chat-item' + (c.id === state.activeId ? ' active' : '');
+      item.innerHTML =
+        '<span class="title">' + escapeHtml(c.title || 'New chat') + '</span>' +
+        '<button class="del" aria-label="Delete chat" title="Delete">' +
+        '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6"/></svg>' +
+        '</button>';
+      item.addEventListener('click', function(e){
+        if(e.target.closest('.del')){
+          e.stopPropagation();
+          deleteChat(c.id);
+          return;
+        }
+        state.activeId = c.id;
+        save();
+        renderAll();
+        closeSidebarMobile();
+      });
+      historyEl.appendChild(item);
+    });
+  }
+
+  function renderThread(){
+    var chat = activeChat();
+    threadInner.innerHTML = '';
+    topbarTitle.textContent = chat.title || 'New chat';
+
+    if(!chat.messages.length){
+      var w = document.createElement('div');
+      w.className = 'welcome';
+      w.innerHTML =
+        '<div class="mark-lg">🥔</div>' +
+        '<h1>What are we digging into?</h1>' +
+        '<p>Chat with the real Potato AI bot. Your chat list is stored on this device.</p>' +
+        '<div class="suggestions">' +
+          '<button class="sugg" data-fill="Summarize this article for me">Summarize an article</button>' +
+          '<button class="sugg" data-fill="Set a reminder for tomorrow at 9am">Set a reminder</button>' +
+          '<button class="sugg" data-fill="سلام! امروز چه کاری می‌تونی برام انجام بدی؟">سلام بگو 🇮🇷</button>' +
+        '</div>';
+      threadInner.appendChild(w);
+      w.querySelectorAll('.sugg').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          composerInput.value = btn.getAttribute('data-fill');
+          autosize();
+          composerInput.focus();
+        });
+      });
+      return;
+    }
+
+    chat.messages.forEach(function(m){
+      threadInner.appendChild(renderMessage(m));
+    });
+  }
+
+  function renderMessage(m){
+    var row = document.createElement('div');
+    row.className = 'msg-row ' + (m.role === 'user' ? 'user' : 'bot');
+
+    var avatar = document.createElement('div');
+    avatar.className = 'avatar ' + (m.role === 'user' ? 'user' : 'bot');
+    avatar.textContent = m.role === 'user' ? 'You' : '🥔';
+
+    var col = document.createElement('div');
+    col.className = 'bubble-col';
+
+    var bubble = document.createElement('div');
+    bubble.className = 'bubble' + (farsiRe.test(m.text) ? ' farsi' : '');
+    if(farsiRe.test(m.text)) bubble.dir = 'rtl';
+    bubble.innerHTML = formatText(m.text || '') + (m.audio ? '<audio class="audio-player" controls src="'+esc(m.audio)+'"></audio>' : '') + (m.images ? '<div class="message-images">'+m.images.map(function(x){return '<a href="'+esc(x.url)+'" target="_blank" rel="noopener"><img src="'+esc(x.url)+'" loading="lazy"></a>';}).join('')+'</div>' : '');
+
+    var meta = document.createElement('div');
+    meta.className = 'msg-meta';
+    meta.textContent = timeLabel(m.time);
+
+    col.appendChild(bubble);
+    col.appendChild(meta);
+    row.appendChild(avatar);
+    row.appendChild(col);
+    return row;
+  }
+
+  function scrollToBottom(){
+    threadEl.scrollTop = threadEl.scrollHeight;
+  }
+
+  function renderAll(){
+    renderSidebar();
+    renderThread();
+    scrollToBottom();
+  }
+
+  /* ---------- Actions ---------- */
+  function newChat(){
+    var id = uid();
+    state.chats.unshift({ id:id, title:'New chat', updatedAt:Date.now(), messages:[] });
+    state.activeId = id;
+    save();
+    renderAll();
+    closeSidebarMobile();
+    composerInput.focus();
+  }
+
+  function deleteChat(id){
+    var idx = state.chats.findIndex(function(c){ return c.id === id; });
+    if(idx === -1) return;
+    state.chats.splice(idx, 1);
+    if(state.activeId === id){
+      state.activeId = state.chats.length ? state.chats[0].id : null;
+      if(!state.activeId){
+        var nid = uid();
+        state.chats = [{ id:nid, title:'New chat', updatedAt:Date.now(), messages:[] }];
+        state.activeId = nid;
+      }
+    }
+    save();
+    renderAll();
+  }
+
+  function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+  function renameActiveChat(){
+    var chat = activeChat();
+    var next = prompt('Rename this chat', chat.title || '');
+    if(next === null) return;
+    next = next.trim();
+    if(next){
+      chat.title = next;
+      save();
+      renderAll();
+    }
+  }
+
+  /* ---------- Live bot connection ---------- */
+  var selectedProvider = 'groq';
+  var appState = { reminders:[], languages:[], uiLanguages:[], personality:null, translateTarget:'auto', aiMode:true, hasPdf:false };
+  var voiceReplyEnabled = false;
+  var PROVIDER_LABELS = {
+    groq: 'Groq',
+    gemini: 'Gemini',
+    groq_search: 'Web search',
+    groq_images: 'Images'
+  };
+
+  async function apiJson(path, body){
+    var res = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.assign({initData: tg ? tg.initData : ''}, body || {}))});
+    var data = await res.json().catch(function(){ return {ok:false,error:'Invalid server response'}; });
+    if(!res.ok || !data.ok) throw new Error(data.error || 'Request failed.');
+    return data;
+  }
+
+  async function loadAppState(){
+    if(!tg || !tg.initData) return;
+    try{
+      var data = await apiJson('/api/state');
+      appState = data;
+      selectedProvider = data.provider || 'groq';
+      providerSelect.value = selectedProvider;
+      renderAll();
+      var adminChip=document.getElementById('adminChip'); if(adminChip) adminChip.style.display=data.is_owner?'flex':'none';
+      var aiChip=document.querySelector('[data-tool="ai_toggle"]'); if(aiChip) aiChip.textContent=data.ai_mode?'⏹️ Stop AI':'▶️ Start AI';
+    }catch(e){ showToast('⚠️ ' + e.message); }
+  }
+
+  function appendBotExtras(chat, data){
+    if(data.images && data.images.length){
+      chat.messages.push({role:'bot', images:data.images, time:Date.now()});
+    }
+  }
+
+  async function synthesizeAndAttach(chat, text){
+    try{
+      var res = await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({initData:tg.initData,text:text})});
+      if(!res.ok) throw new Error('Voice generation failed.');
+      var blob = await res.blob();
+      var url = URL.createObjectURL(blob);
+      chat.messages.push({role:'bot',audio:url,time:Date.now(), audioText:text});
+      save(); renderAll();
+    }catch(e){ showToast('⚠️ '+e.message); }
+  }
+
+  async function translateDirect(text){
+    var data = await apiJson('/api/translate',{message:text,target:appState.translateTarget || 'auto'});
+    return data.reply;
+  }
+
+  async function sendMessage(){
+    var text = composerInput.value.trim();
+    if(!text) return;
+    if(!tg || !tg.initData){ showToast('Open this app from Telegram first.'); return; }
+    var chat = activeChat();
+    chat.messages.push({ role:'user', text:text, time:Date.now() });
+    if(chat.title === 'New chat' || !chat.title) chat.title = text.length > 42 ? text.slice(0,42) + '…' : text;
+    chat.updatedAt = Date.now(); composerInput.value = ''; autosize(); save(); renderAll();
+
+    var typingRow = document.createElement('div');
+    typingRow.className = 'msg-row bot';
+    typingRow.innerHTML = '<div class="avatar bot">🥔</div><div class="bubble-col"><div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div></div>';
+    threadInner.appendChild(typingRow); scrollToBottom(); sendBtn.disabled = true;
+    try{
+      var data;
+      if(selectedProvider === 'translate'){
+        data = await apiJson('/api/translate',{message:text,target:appState.translateTarget || 'auto'});
+      }else{
+        data = await apiJson('/api/chat',{message:text,provider:selectedProvider});
+      }
+      typingRow.remove();
+      chat.messages.push({ role:'bot', text:data.reply || 'I got an empty response.', time:Date.now() });
+      appendBotExtras(chat,data);
+      chat.updatedAt = Date.now(); save(); renderAll();
+      if(voiceReplyEnabled && data.reply) await synthesizeAndAttach(chat,data.reply);
+    }catch(err){
+      typingRow.remove();
+      chat.messages.push({role:'bot',text:'⚠️ '+(err.message || 'Something went wrong. Please try again.'),time:Date.now()});
+      chat.updatedAt = Date.now(); save(); renderAll();
+    }finally{ sendBtn.disabled=false; composerInput.focus(); }
+  }
+
+  function autosize(){
+    composerInput.style.height = 'auto';
+    composerInput.style.height = Math.min(composerInput.scrollHeight, 160) + 'px';
+  }
+
+  function openSidebarMobile(){ app.classList.add('sidebar-open'); }
+  function closeSidebarMobile(){ app.classList.remove('sidebar-open'); }
+
+  function toggleTheme(){
+    var cur = root.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+    var next = cur === 'light' ? 'dark' : 'light';
+    root.setAttribute('data-theme', next);
+    themeLabel.textContent = next === 'light' ? 'Dark' : 'Light';
+    try{ localStorage.setItem(THEME_KEY, next); }catch(e){}
+  }
+
+  /* ---------- Wire up ---------- */
+  newChatBtn.addEventListener('click', newChat);
+  menuBtn.addEventListener('click', openSidebarMobile);
+  backdrop.addEventListener('click', closeSidebarMobile);
+  editTitleBtn.addEventListener('click', renameActiveChat);
+  themeBtn.addEventListener('click', toggleTheme);
+  searchInput.addEventListener('input', renderSidebar);
+  sendBtn.addEventListener('click', sendMessage);
+  composerInput.addEventListener('input', autosize);
+  composerInput.addEventListener('keydown', function(e){
+    if(e.key === 'Enter' && !e.shiftKey){
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+  clearBtn.addEventListener('click', function(){
+    if(!confirm('Delete all chats on this device?')) return;
+    var nid = uid();
+    state.chats = [{ id:nid, title:'New chat', updatedAt:Date.now(), messages:[] }];
+    state.activeId = nid;
+    save();
+    renderAll();
+  });
+  providerSelect.addEventListener('change', async function(){
+    selectedProvider = providerSelect.value;
+    try{ await apiJson('/api/settings',{action:selectedProvider === 'translate' ? 'translate_target' : 'provider', provider:selectedProvider, target:appState.translateTarget || 'auto'}); appState.provider=selectedProvider; showToast('Mode: '+PROVIDER_LABELS[selectedProvider]); }
+    catch(e){ showToast('⚠️ '+e.message); }
+  });
+
+  toolRow.addEventListener('click', function(e){
+    var chip = e.target.closest('.tool-chip'); if(!chip) return;
+    var tool = chip.getAttribute('data-tool');
+    if(tool === 'translate') openTranslateModal();
+    else if(tool === 'voice') openVoiceModal();
+    else if(tool === 'remind') openReminderModal();
+    else if(tool === 'personality') openPersonalityModal();
+    else if(tool === 'pdf') openPdfModal();
+    else if(tool === 'language') openLanguageModal();
+    else if(tool === 'ai_toggle') toggleAiMode();
+    else if(tool === 'help') openHelpModal();
+    else if(tool === 'admin') openAdminModal();
+  });
+
+  async function toggleAiMode(){
+    try{
+      var action=appState.aiMode?'stop':'start';
+      var d=await apiJson('/api/settings',{action:action});
+      appState.aiMode=d.ai_mode;
+      showToast(appState.aiMode?'▶️ AI mode enabled':'⏹️ AI mode stopped');
+      var chip=document.querySelector('[data-tool="ai_toggle"]'); if(chip) chip.textContent=appState.aiMode?'⏹️ Stop AI':'▶️ Start AI';
+    }catch(e){showToast('⚠️ '+e.message);}
+  }
+
+  async function openAdminModal(){
+    try{
+      var d=await apiJson('/api/admin',{action:'stats'});
+      openModal('🔐 Admin panel','<div class="setting-card"><strong>Bot statistics</strong><small>Users: '+d.users+' · Messages: '+d.total_messages+' · Maintenance: '+(d.maintenance?'ON':'OFF')+'</small></div><div class="actions"><button class="secondary" id="adminUsers">View users</button><button class="secondary" id="adminMaintenance">'+(d.maintenance?'Disable maintenance':'Enable maintenance')+'</button></div><div class="field" style="margin-top:12px"><label>Broadcast to all users</label><textarea id="broadcastText" maxlength="4000" placeholder="Message for every user…"></textarea></div><div class="actions"><button class="primary" id="sendBroadcast">Send broadcast</button></div>');
+      document.getElementById('adminMaintenance').onclick=async function(){try{var x=await apiJson('/api/admin',{action:'maintenance',enabled:!d.maintenance});showToast(x.maintenance?'Maintenance enabled':'Maintenance disabled');openAdminModal();}catch(e){showToast('⚠️ '+e.message);}};
+      document.getElementById('sendBroadcast').onclick=async function(){var t=document.getElementById('broadcastText').value.trim();if(!t)return showToast('Write a broadcast first.');if(!confirm('Send this message to all users?'))return;try{var x=await apiJson('/api/admin',{action:'broadcast',text:t});showToast('Broadcast sent: '+x.sent+' · failed: '+x.failed);}catch(e){showToast('⚠️ '+e.message);}};
+      document.getElementById('adminUsers').onclick=async function(){try{var x=await apiJson('/api/admin',{action:'users'});var rows=x.users.map(function(u){return '<div class="reminder-item"><div><strong>'+esc(u.name)+'</strong><div class="when">ID '+esc(u.id)+' · '+u.messages+' messages</div></div></div>';}).join('')||'<div class="setting-card"><small>No users.</small></div>';openModal('👥 Users',rows+'<div class="actions"><button class="secondary" id="backAdmin">Back</button></div>');document.getElementById('backAdmin').onclick=openAdminModal;}catch(e){showToast('⚠️ '+e.message);}};
+    }catch(e){showToast('⚠️ '+e.message);}
+  }
+
+  function openHelpModal(){
+    openModal('❓ Potato AI help','<div class="setting-card"><strong>🤖 AI</strong><small>Switch between Groq and Gemini, or use Web search / Images modes.</small></div><div class="setting-card"><strong>🌐 Translate</strong><small>Pick one of 40+ supported translation languages, or use automatic Persian ⇄ English mode.</small></div><div class="setting-card"><strong>🎙️ Voice</strong><small>Record your message for speech-to-text, or enable automatic voice replies.</small></div><div class="setting-card"><strong>⏰ Reminders</strong><small>Create one-time, hourly, daily, or weekly reminders. Up to 20 are stored per user.</small></div><div class="setting-card"><strong>🎭 Personality</strong><small>Choose a preset or write your own custom personality.</small></div><div class="setting-card"><strong>📄 PDF</strong><small>Upload a text PDF up to 20 MB and ask questions about its contents.</small></div><div class="setting-card"><strong>🧠 Memory</strong><small>The AI can remember useful facts about you and use them in later chats when its memory tools are available.</small></div><div class="setting-card"><strong>🛑 AI mode</strong><small>Stop or start AI replies from the toolbar.</small></div>');
+  }
+
+  async function openTranslateModal(){
+    var options = appState.languages.map(function(x){return '<option value="'+esc(x.code)+'" '+(x.code===(appState.translateTarget||'auto')?'selected':'')+'>'+esc(x.label)+' — '+esc(x.name)+'</option>';}).join('');
+    openModal('🌐 Translation', '<div class="field"><label>Target language</label><select id="translateTarget"><option value="auto">🔄 فارسی ⇄ English</option>'+options+'</select></div><div class="setting-card"><strong>How it works</strong><small>Choose a target, then send text normally. If the text is already in the selected language, the bot follows the same behavior as the Telegram /translate feature.</small></div><div class="actions"><button class="primary" id="saveTranslate">Use translation mode</button></div>');
+    document.getElementById('saveTranslate').onclick=async function(){
+      var target=document.getElementById('translateTarget').value; appState.translateTarget=target; selectedProvider='translate'; providerSelect.value='translate';
+      try{await apiJson('/api/settings',{action:'translate_target',target:target}); closeModal(); showToast('🌐 Translation mode enabled');}catch(e){showToast('⚠️ '+e.message);}
+    };
+  }
+
+  function openVoiceModal(){
+    openModal('🔊 Voice replies', '<div class="setting-card"><strong>Voice reply</strong><small>Automatically generate a playable voice version of every AI reply in the detected language.</small></div><div class="actions"><button class="primary" id="voiceToggle">'+(voiceReplyEnabled?'Disable voice replies':'Enable voice replies')+'</button><button class="secondary" id="voiceTest">Test last reply</button></div>');
+    document.getElementById('voiceToggle').onclick=function(){voiceReplyEnabled=!voiceReplyEnabled; closeModal(); showToast(voiceReplyEnabled?'🔊 Voice replies enabled':'🔇 Voice replies disabled');};
+    document.getElementById('voiceTest').onclick=function(){var c=activeChat(), last=c.messages.slice().reverse().find(function(m){return m.role==='bot'&&m.text;}); if(last) synthesizeAndAttach(c,last.text); else showToast('No AI reply to test yet.');};
+  }
+
+  async function openReminderModal(){
+    await refreshReminders();
+    var items=appState.reminders.map(function(r){return '<div class="reminder-item"><div><strong>'+esc(r.text)+'</strong><div class="when">'+esc(r.when)+' · '+esc(r.repeat)+'</div></div><button class="danger" data-rid="'+esc(r.id)+'">Delete</button></div>';}).join('') || '<div class="setting-card"><small>No reminders yet.</small></div>';
+    openModal('⏰ Reminders', '<div id="reminderList">'+items+'</div><div class="setting-card"><strong>Add reminder</strong><div class="form-grid"><div class="field"><label>Type</label><select id="remType"><option value="delay">In…</option><option value="clock">At a time</option></select></div><div class="field"><label>Repeat</label><select id="remRepeat"><option value="none">Once</option><option value="hourly">Hourly</option><option value="daily">Daily</option><option value="weekly">Weekly</option></select></div><div class="field" id="delayField"><label>Seconds from now</label><input id="remSeconds" type="number" min="1" value="3600"></div><div class="field" id="clockField" style="display:none"><label>Local time</label><input id="remClock" type="time"></div><div class="field full"><label>Reminder text</label><input id="remText" maxlength="500" placeholder="What should I remind you about?"></div></div><div class="actions"><button class="primary" id="addReminder">Add reminder</button></div></div>');
+    document.getElementById('remType').onchange=function(){var c=this.value==='clock';document.getElementById('delayField').style.display=c?'none':'';document.getElementById('clockField').style.display=c?'':'none';};
+    document.getElementById('addReminder').onclick=async function(){try{var type=document.getElementById('remType').value;var data=await apiJson('/api/reminders',{action:'add',text:document.getElementById('remText').value,repeat:document.getElementById('remRepeat').value,when_type:type,seconds:parseInt(document.getElementById('remSeconds').value||0,10),clock:document.getElementById('remClock').value,tz:Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Tehran'});appState.reminders.push(data.reminder);closeModal();showToast('⏰ Reminder added');}catch(e){showToast('⚠️ '+e.message);}};
+    document.querySelectorAll('[data-rid]').forEach(function(btn){btn.onclick=async function(){try{await apiJson('/api/reminders',{action:'delete',id:btn.getAttribute('data-rid')});openReminderModal();}catch(e){showToast('⚠️ '+e.message);}};});
+  }
+
+  async function refreshReminders(){try{var d=await apiJson('/api/reminders',{action:'list'});appState.reminders=d.reminders||[];}catch(e){}}
+
+  function openPersonalityModal(){
+    var opts=(appState.personality&&appState.personality.options||[]).map(function(x){return '<button class="option-btn '+(appState.personality.preset===x.code?'active':'')+'" data-pers="'+esc(x.code)+'">'+esc(x.label)+'</button>';}).join('');
+    openModal('🎭 Personality', '<div class="setting-card"><strong>Choose how Potato AI talks</strong><small>Your selection is saved with your account and also affects normal Telegram chats.</small></div><div class="option-grid">'+opts+'</div><div class="field" style="margin-top:10px"><label>Custom personality</label><textarea id="customPers" maxlength="400" placeholder="Describe the tone you want…">'+esc((appState.personality&&appState.personality.custom)||'')+'</textarea></div><div class="actions"><button class="primary" id="saveCustom">Save custom</button></div>');
+    document.querySelectorAll('[data-pers]').forEach(function(btn){btn.onclick=async function(){try{var d=await apiJson('/api/settings',{action:'personality',preset:btn.getAttribute('data-pers')});appState.personality=d.personality;closeModal();showToast('🎭 Personality updated');}catch(e){showToast('⚠️ '+e.message);}};});
+    document.getElementById('saveCustom').onclick=async function(){var t=document.getElementById('customPers').value.trim();if(!t){showToast('Write a custom personality first.');return;}try{var d=await apiJson('/api/settings',{action:'personality',preset:'custom',custom:t});appState.personality=d.personality;closeModal();showToast('🎭 Custom personality saved');}catch(e){showToast('⚠️ '+e.message);}};
+  }
+
+  function openLanguageModal(){
+    var opts=(appState.ui_languages||[]).map(function(x){return '<option value="'+esc(x.code)+'" '+(x.code===(appState.ui_language||'en')?'selected':'')+'>'+esc(x.label)+'</option>';}).join('');
+    openModal('🌍 Interface language','<div class="field"><label>Bot interface language</label><select id="uiLang">'+opts+'</select></div><div class="actions"><button class="primary" id="saveUiLang">Save</button></div>');
+    document.getElementById('saveUiLang').onclick=async function(){try{var lang=document.getElementById('uiLang').value;await apiJson('/api/settings',{action:'ui_language',language:lang});appState.ui_language=lang;closeModal();showToast('🌍 Interface language updated');}catch(e){showToast('⚠️ '+e.message);}};
+  }
+
+  function openPdfModal(){
+    openModal('📄 PDF / document', '<div class="setting-card">'+(appState.has_pdf?'<strong>Active: '+esc(appState.pdf.name)+' ('+appState.pdf.pages+' pages)</strong><small>Send a question in the chat and Potato AI will answer from the relevant parts of this PDF.</small>':'<strong>No PDF loaded</strong><small>Upload a text-based PDF (20 MB max). Scanned image-only PDFs are not supported.</small>')+'</div><div class="upload-row"><input id="pdfFile" type="file" accept="application/pdf"><button class="primary" id="uploadPdf">Upload PDF</button>'+ (appState.has_pdf?'<button class="secondary" id="clearPdf">Clear</button>':'')+'</div>');
+    document.getElementById('uploadPdf').onclick=async function(){var f=document.getElementById('pdfFile').files[0];if(!f){showToast('Choose a PDF first.');return;}var fd=new FormData();fd.append('initData',tg.initData);fd.append('file',f);try{var res=await fetch('/api/pdf',{method:'POST',body:fd});var d=await res.json();if(!res.ok||!d.ok)throw new Error(d.error||'Upload failed');appState.has_pdf=true;appState.pdf=d.pdf;selectedProvider='groq';providerSelect.value='groq';closeModal();showToast('📄 PDF loaded');}catch(e){showToast('⚠️ '+e.message);}};
+    var clear=document.getElementById('clearPdf');if(clear)clear.onclick=async function(){try{await apiJson('/api/settings',{action:'clear_pdf'});appState.has_pdf=false;appState.pdf=null;closeModal();showToast('📄 PDF cleared');}catch(e){showToast('⚠️ '+e.message);}};
+  }
+
+  function openModal(title,html){modalTitle.textContent=title;modalBody.innerHTML=html;modalBackdrop.classList.add('open');}
+  function closeModal(){modalBackdrop.classList.remove('open');modalBody.innerHTML='';}
+  modalClose.addEventListener('click',closeModal);
+  modalBackdrop.addEventListener('click',function(e){if(e.target===modalBackdrop)closeModal();});
+
+  recordBtn.addEventListener('click', async function(){
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){showToast('Voice recording is not supported here.');return;}
+    if(recordBtn.classList.contains('recording')){ if(window._potatoRecorder) window._potatoRecorder.stop(); return; }
+    try{
+      var stream=await navigator.mediaDevices.getUserMedia({audio:true});
+      var mime=MediaRecorder.isTypeSupported('audio/webm;codecs=opus')?'audio/webm;codecs=opus':'audio/webm';
+      var rec=new MediaRecorder(stream,{mimeType:mime}); var chunks=[]; window._potatoRecorder=rec;
+      rec.ondataavailable=function(e){if(e.data.size)chunks.push(e.data);};
+      rec.onstop=async function(){stream.getTracks().forEach(function(t){t.stop();});recordBtn.classList.remove('recording');recordBtn.textContent='🎙️';var blob=new Blob(chunks,{type:mime});var fd=new FormData();fd.append('initData',tg.initData);fd.append('audio',blob,'voice.webm');try{var res=await fetch('/api/voice',{method:'POST',body:fd});var d=await res.json();if(!res.ok||!d.ok)throw new Error(d.error||'Voice transcription failed');composerInput.value=d.text;autosize();showToast('🎙️ Transcribed — press Send');}catch(e){showToast('⚠️ '+e.message);}};
+      rec.start();recordBtn.classList.add('recording');recordBtn.textContent='⏹️';showToast('🎙️ Recording… press again to stop');
+    }catch(e){showToast('Microphone permission was denied.');}
+  });
+
+
+  /* ---------- Init ---------- */
+  load();
+  try{
+    var savedTheme = localStorage.getItem(THEME_KEY);
+    if(savedTheme) root.setAttribute('data-theme', savedTheme);
+  }catch(e){}
+  applyTelegramTheme();
+  if(tg && tg.onEvent){
+    tg.onEvent('themeChanged', applyTelegramTheme);
+  }
+  renderAll();
+  autosize();
+  loadAppState();
+})();
+</script>
+</body>
+</html>
