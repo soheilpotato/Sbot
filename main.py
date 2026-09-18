@@ -1,6 +1,7 @@
 import os
 import json
 import io
+import time
 import uuid
 import subprocess
 import threading
@@ -156,6 +157,111 @@ BOT_STATS.setdefault("maintenance", False)
 BOT_BOOTED_AT = datetime.now(ZoneInfo("UTC"))
 
 
+# ---------------------- LONG-TERM USER MEMORY (Upstash Redis) ----------------------
+# This is what actually fixes "I told the bot my name and it forgot after
+# redeploy": `context.user_data` (used for conversation history below) lives
+# only in RAM and is wiped every time the process restarts - a Render
+# redeploy, a crash, anything. It was never connected to Upstash at all, so
+# ANY fact the AI said it would "remember" was only ever real for as long as
+# the process stayed up.
+#
+# This store is separate from conversation history: it's a small, per-user
+# list of short facts (name, preferences, ongoing situations) that the AI
+# explicitly chooses to save via the remember_fact tool (see TOOLS below),
+# persisted in the same Upstash Redis database already used for bot_stats -
+# so it survives redeploys, crashes, and even long conversations where the
+# regular history gets trimmed.
+USER_MEMORY_KEY_PREFIX = "user_memory:"
+MAX_MEMORY_FACTS = 60  # keep it bounded - oldest facts drop off first
+
+
+def _load_user_memory(user_id: int) -> list:
+    """Returns the list of remembered fact strings for this user, or []
+    if Upstash isn't configured / nothing is saved yet / the call fails.
+    Blocking - callers on the event loop should wrap this in
+    asyncio.to_thread."""
+    if not (UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN):
+        return []
+    try:
+        result = _upstash_command("GET", f"{USER_MEMORY_KEY_PREFIX}{user_id}").get("result")
+        if result:
+            return json.loads(result)
+    except Exception as e:
+        print(f"[memory] failed to load memory for user {user_id}: {e}")
+    return []
+
+
+def _save_user_memory(user_id: int, facts: list) -> None:
+    """Blocking - callers on the event loop should wrap this in
+    asyncio.to_thread. Silently no-ops if Upstash isn't configured, same
+    fallback behaviour as bot_stats above."""
+    if not (UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN):
+        return
+    try:
+        _upstash_command(
+            "SET", f"{USER_MEMORY_KEY_PREFIX}{user_id}", json.dumps(facts, ensure_ascii=False)
+        )
+    except Exception as e:
+        print(f"[memory] failed to save memory for user {user_id}: {e}")
+
+
+async def remember_fact_tool(user_id: int, fact: str) -> str:
+    """Called when the AI decides something the user said is worth
+    remembering long-term (name, preference, ongoing situation, etc.)."""
+    fact = (fact or "").strip()
+    if not fact:
+        return "هیچ متنی برای ذخیره‌سازی داده نشد."
+
+    def _do() -> int:
+        facts = _load_user_memory(user_id)
+        if fact not in facts:
+            facts.append(fact)
+            if len(facts) > MAX_MEMORY_FACTS:
+                facts[:] = facts[-MAX_MEMORY_FACTS:]
+            _save_user_memory(user_id, facts)
+        return len(facts)
+
+    count = await asyncio.to_thread(_do)
+    return f"ذخیره شد - همیشه یادم می‌مونه. الان {count} مورد درباره این کاربر ذخیره شده."
+
+
+# context.user_data already caches conversation history per user for free
+# (it's just RAM); piggyback on it to also cache the long-term-memory GET,
+# so a chatty session doesn't re-fetch the same facts from Upstash on every
+# message. Short TTL rather than "forever this process" so a fact saved via
+# remember_fact still shows up in Gemini mode (which rebuilds its system
+# prompt every message) reasonably soon, without needing to plumb a
+# cache-invalidation callback through the tool-call machinery.
+MEMORY_CACHE_TTL_SECONDS = 300
+
+
+async def _get_memory_facts_cached(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list:
+    cache = context.user_data.get("_memory_cache")
+    now = time.monotonic()
+    if cache and now - cache["loaded_at"] < MEMORY_CACHE_TTL_SECONDS:
+        return cache["facts"]
+    facts = await asyncio.to_thread(_load_user_memory, user_id)
+    context.user_data["_memory_cache"] = {"facts": facts, "loaded_at": now}
+    return facts
+
+
+async def forget_fact_tool(user_id: int, fact: str) -> str:
+    """Called when a previously remembered fact is no longer true or the
+    user explicitly asks to have it forgotten."""
+    fact = (fact or "").strip()
+
+    def _do() -> bool:
+        facts = _load_user_memory(user_id)
+        new_facts = [f for f in facts if f != fact]
+        changed = len(new_facts) != len(facts)
+        if changed:
+            _save_user_memory(user_id, new_facts)
+        return changed
+
+    changed = await asyncio.to_thread(_do)
+    return "پاک شد و دیگه بهش استناد نمی‌کنم." if changed else "همچین موردی بین چیزهای ذخیره‌شده پیدا نکردم."
+
+
 def record_user_activity(update: Update) -> None:
     """Called on every incoming update (group=-1, before any other handler)
     so the admin panel has real numbers to show. Only updates BOT_STATS in
@@ -179,12 +285,33 @@ def record_user_activity(update: Update) -> None:
         print(f"[stats] record_user_activity failed: {e}")
 
 
+# Full BOT_STATS blob only gets actually PUSHED to Upstash at most this
+# often, instead of on every single message. record_user_activity() still
+# updates the in-memory numbers instantly on every message (the admin panel
+# always reads current numbers), but re-uploading the whole growing JSON
+# blob on every message is the single biggest driver of data-transfer usage
+# for a bot with any real traffic - a batch of messages in the same
+# window now costs one write instead of one each. Worst case if the
+# process dies mid-window: the last few minutes of message counts aren't
+# reflected in Upstash yet - nothing this bot treats as critical.
+STATS_SAVE_INTERVAL_SECONDS = 30
+_stats_last_flush = 0.0
+_stats_flush_lock = threading.Lock()
+
+
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _stats_last_flush
     record_user_activity(update)
-    # _save_stats() now does a network call (Upstash) instead of a local
-    # disk write, so it's pushed to a thread to avoid blocking the bot
-    # while it waits on that request.
-    await asyncio.to_thread(_save_stats)
+
+    now = time.monotonic()
+    with _stats_flush_lock:
+        should_flush = now - _stats_last_flush >= STATS_SAVE_INTERVAL_SECONDS
+        if should_flush:
+            _stats_last_flush = now
+    if should_flush:
+        # Network call (Upstash) - pushed to a thread so it never blocks
+        # the bot while it waits on the request.
+        await asyncio.to_thread(_save_stats)
 
 
 def _format_duration(delta) -> str:
@@ -291,10 +418,48 @@ reserved ONLY for this person; never call anyone else this way.
 """
 
 
-def build_system_prompt(owner: bool) -> str:
+# Only appended when remember_fact/forget_fact are actually wired up as
+# real, callable tools for this provider (currently: groq, groq_search).
+# Gemini mode below does NOT get this, on purpose - it has no live tool
+# use here, so promising a "remember_fact tool" it can't actually call
+# would recreate the exact "bot said it'll remember but doesn't" bug this
+# was meant to fix. Gemini still gets to *see* previously saved facts
+# (via the plain facts block), just not save new ones itself.
+MEMORY_TOOL_INSTRUCTIONS = """
+LONG-TERM MEMORY:
+- You have a remember_fact tool. Unlike web_search/fetch_page/
+  get_current_datetime (which only help with THIS one reply), remember_fact
+  permanently saves a short fact about the user - their name, a preference,
+  an ongoing situation, anything they'd expect you to still know the next
+  time they talk to you, even after the bot restarts.
+- The moment the user tells you something like this, actually CALL
+  remember_fact right away. Don't just say "I'll remember that" in your
+  reply text without calling the tool - the tool call is what makes it real.
+- If a remembered fact turns out to be outdated or the user asks you to
+  forget something, call forget_fact.
+- If you genuinely cannot save something (the tool call fails), be honest
+  about that instead of claiming you saved it.
+- Don't narrate the mechanism of saving - a natural "حتما یادم می‌مونه" is
+  fine, explaining tools/Redis/etc. is not.
+- If a "LONG-TERM MEMORY ABOUT THIS USER" section appears below, those facts
+  are already saved from earlier sessions - use them naturally, don't ask
+  the user to repeat them, and don't re-save the same fact again.
+"""
+
+
+def build_system_prompt(owner: bool, memory_facts: list | None = None, tools_available: bool = True) -> str:
+    prompt = BASE_SYSTEM_PROMPT
+    if tools_available:
+        prompt += "\n" + MEMORY_TOOL_INSTRUCTIONS
+    if memory_facts:
+        facts_block = "\n".join(f"- {f}" for f in memory_facts)
+        prompt += (
+            "\n\nLONG-TERM MEMORY ABOUT THIS USER (persisted across sessions, "
+            "already true, don't ask again):\n" + facts_block
+        )
     if owner:
-        return BASE_SYSTEM_PROMPT + "\n" + OWNER_ADDRESS_INSTRUCTION
-    return BASE_SYSTEM_PROMPT
+        prompt += "\n" + OWNER_ADDRESS_INSTRUCTION
+    return prompt
 # ----------------------------------------------------------------------------------------------------------------------
 
 
@@ -681,10 +846,50 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_fact",
+            "description": (
+                "Permanently save one short fact about the user (name, "
+                "preference, ongoing situation, anything they'd expect you "
+                "to still know next time) so it survives a bot restart. "
+                "Call this immediately when the user shares something worth "
+                "remembering long-term - don't just say you'll remember it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": "The short fact to remember, in the user's own language, e.g. 'اسم کاربر علی است' or 'User's name is Ali'.",
+                    }
+                },
+                "required": ["fact"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_fact",
+            "description": "Remove a previously remembered fact about the user that is no longer true or that the user asked you to forget.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": "The exact fact text (as it was remembered) to remove.",
+                    }
+                },
+                "required": ["fact"],
+            },
+        },
+    },
 ]
 
 
-async def execute_tool(tool_call) -> str:
+async def execute_tool(tool_call, user_id: int) -> str:
     name = tool_call.function.name
     try:
         args = json.loads(tool_call.function.arguments or "{}")
@@ -697,6 +902,10 @@ async def execute_tool(tool_call) -> str:
         return await fetch_page(args.get("url", ""))
     if name == "get_current_datetime":
         return get_current_datetime(args.get("timezone", "UTC"))
+    if name == "remember_fact":
+        return await remember_fact_tool(user_id, args.get("fact", ""))
+    if name == "forget_fact":
+        return await forget_fact_tool(user_id, args.get("fact", ""))
     return f"ابزار ناشناخته: {name}"
 
 
@@ -761,7 +970,7 @@ FORCE_SEARCH_HINT = {
 }
 
 
-async def run_groq_agent(history: list, model: str = GROQ_MODEL, force_search: bool = False) -> str:
+async def run_groq_agent(history: list, user_id: int, model: str = GROQ_MODEL, force_search: bool = False) -> str:
     # The user's actual question, so we can rebuild a clean prompt later.
     original_user_text = history[-1]["content"] if history and history[-1].get("role") == "user" else ""
 
@@ -859,7 +1068,7 @@ async def run_groq_agent(history: list, model: str = GROQ_MODEL, force_search: b
         )
 
         for tc in msg.tool_calls:
-            result = await execute_tool(tc)
+            result = await execute_tool(tc, user_id)
             gathered_info.append(f"[{tc.function.name}] {result}")
             working.append(
                 {
@@ -1938,24 +2147,38 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
         await send_ai_reply(update, context, translated)
         return
 
+    user_id = update.effective_user.id
+
     history_key = f"history_{provider}"
     history = context.user_data.setdefault(history_key, [])
 
     # Groq (OpenAI-style) wants the system prompt as the first message in the
-    # list. Gemini takes its system prompt separately via config, so it's
-    # never added to its own history list. groq_search uses the same
-    # OpenAI-style chat format as groq, just with a different model. The
-    # prompt is built per-user so only the configured owner gets addressed
-    # as "پدر"/"Father" - everyone else gets the normal polite prompt.
+    # list. Gemini takes its system prompt separately via config (handled in
+    # its own branch below), so it's never added to its own history list.
+    # groq_search uses the same OpenAI-style chat format as groq, just with
+    # a different model. The prompt is built per-user so only the configured
+    # owner gets addressed as "پدر"/"Father" - everyone else gets the normal
+    # polite prompt, and includes whatever long-term facts are on file for
+    # this user. Long-term facts are only fetched here - once, when a fresh
+    # session starts - not on every message; they're baked into the system
+    # message and ride along with `history` for the rest of the session.
     if not history and provider in ("groq", "groq_search"):
-        history.append({"role": "system", "content": build_system_prompt(owner)})
+        memory_facts = await _get_memory_facts_cached(context, user_id)
+        history.append({"role": "system", "content": build_system_prompt(owner, memory_facts)})
 
     # Add the user's new message to this provider's own memory
     history.append({"role": "user", "content": user_text})
 
-    # Trim history so it doesn't grow forever
+    # Trim history so it doesn't grow forever. Keep the system message (index
+    # 0, if present) no matter what - otherwise a long conversation quietly
+    # loses its instructions (and the long-term-memory facts baked into it
+    # above) once it scrolls past MAX_HISTORY turns, which looked just like
+    # "the bot forgot" even without a redeploy.
     if len(history) > MAX_HISTORY:
-        history[:] = history[-MAX_HISTORY:]
+        if history and history[0].get("role") == "system":
+            history[:] = [history[0]] + history[-(MAX_HISTORY - 1):]
+        else:
+            history[:] = history[-MAX_HISTORY:]
 
     # Show "typing..." while we wait on the AI
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -1991,8 +2214,12 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
             ]
         else:
             messages_for_api = history
+        memory_facts = await _get_memory_facts_cached(context, user_id)
         try:
-            reply_text = await call_gemini(messages_for_api, build_system_prompt(owner))
+            reply_text = await call_gemini(
+                messages_for_api,
+                build_system_prompt(owner, memory_facts, tools_available=False),
+            )
         except Exception as e:
             await _handle_ai_failure(update, context, history, provider, e)
             return
@@ -2004,7 +2231,7 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
         # (provider == "groq_search") just forces the first search to happen.
         force_search = provider == "groq_search"
         try:
-            reply_text = await run_groq_agent(history, force_search=force_search)
+            reply_text = await run_groq_agent(history, user_id, force_search=force_search)
         except Exception as e:
             await _handle_ai_failure(update, context, history, provider, e)
             return
