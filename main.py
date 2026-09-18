@@ -19,7 +19,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
-    InputMediaPhoto,
     InputTextMessageContent,
     Update,
     BotCommand,
@@ -1500,21 +1499,33 @@ def _ddg_images_sync(query: str, max_results: int = 5) -> list:
 
 async def search_images(query: str, count: int = 4) -> list:
     count = max(1, min(int(count or 4), MAX_IMAGES_PER_BATCH))
-    # Ask for a few extra: some results are dead links or unfetchable, and
-    # it's better to over-fetch metadata than to end up sending two photos.
-    return await asyncio.to_thread(_ddg_images_sync, query, count + 4)
+    # Ask for more than needed: with per-image fallback (see send_image_batch)
+    # a handful of dead/blocked links no longer sinks the whole batch, but we
+    # still want enough candidates left over to reach `count` real sends.
+    return await asyncio.to_thread(_ddg_images_sync, query, count + 6)
 
 
 def _download_image_sync(url: str) -> bytes | None:
     try:
-        resp = requests.get(
-            url,
-            timeout=10,
-            stream=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"},
-        )
+        parsed_root = re.match(r"^(https?://[^/]+)", url)
+        headers = {
+            # Sites that hotlink-protect their images tend to check both of
+            # these; DDG's own generic UA/no-referer request gets a 403 from
+            # a lot of hosts (this was the actual cause of "found the search
+            # results but couldn't send a picture").
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": parsed_root.group(1) + "/" if parsed_root else "https://duckduckgo.com/",
+        }
+        resp = requests.get(url, timeout=12, stream=True, headers=headers)
         resp.raise_for_status()
-        if "image" not in resp.headers.get("Content-Type", ""):
+        content_type = resp.headers.get("Content-Type", "")
+        if "image" not in content_type and not url.lower().split("?")[0].endswith(
+            (".jpg", ".jpeg", ".png", ".webp", ".gif")
+        ):
             return None
         data = b""
         for chunk in resp.iter_content(64 * 1024):
@@ -1529,58 +1540,58 @@ def _download_image_sync(url: str) -> bytes | None:
 async def send_image_batch(
     bot, chat_id: int, batch: dict, reply_to_message_id: int | None = None
 ) -> int:
-    """Send one search_images result set as a real Telegram photo album.
-    Images are downloaded here rather than handed to Telegram as URLs,
-    because a lot of image hosts block Telegram's fetcher and you'd just get
-    an error instead of a photo. Returns how many were actually sent."""
+    """Send one search_images result set as real Telegram photos.
+
+    Two strategies, tried in order per image:
+      1. Hand Telegram the URL directly and let ITS servers fetch it. This
+         works for most hosts and is instant - no download through Render's
+         IP at all, which a lot of image hosts throttle or block outright.
+      2. If Telegram can't fetch it (private/broken/hotlink-protected host),
+         download it ourselves with browser-like headers and send the raw
+         bytes instead.
+    Sent one at a time rather than as a single album: an album is all-or-
+    nothing, so one bad link used to silently sink every other photo in the
+    batch - which is exactly what was happening before.
+    """
     query = batch.get("query", "")
-    results = batch.get("results", [])[: MAX_IMAGES_PER_BATCH + 4]
+    candidates = batch.get("results", [])[: MAX_IMAGES_PER_BATCH + 6]
     wanted = batch.get("count", MAX_IMAGES_PER_BATCH)
 
-    downloads = await asyncio.gather(
-        *(asyncio.to_thread(_download_image_sync, r["url"]) for r in results)
-    )
+    sent = 0
+    for i, result in enumerate(candidates):
+        if sent >= wanted:
+            break
+        caption = f"🖼 {query}" if sent == 0 else None
+        reply_id = reply_to_message_id if sent == 0 else None
 
-    blobs, used = [], []
-    for result, data in zip(results, downloads):
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=result["url"],
+                caption=caption,
+                reply_to_message_id=reply_id,
+            )
+            sent += 1
+            continue
+        except Exception as e:
+            print(f"[images] direct-URL send failed for {result['url']}: {e}")
+
+        data = await asyncio.to_thread(_download_image_sync, result["url"])
         if not data:
             continue
-        blobs.append(data)
-        used.append(result)
-        if len(blobs) >= wanted:
-            break
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=io.BytesIO(data),
+                caption=caption,
+                reply_to_message_id=reply_id,
+            )
+            sent += 1
+        except Exception as e:
+            print(f"[images] fallback download-send also failed for {result['url']}: {e}")
+            continue
 
-    if not blobs:
-        return 0
-
-    caption_lines = [f"🖼 {query}"]
-    for i, result in enumerate(used, start=1):
-        if result["title"]:
-            caption_lines.append(f"{i}. {result['title']}")
-    caption = "\n".join(caption_lines)[:1000]
-
-    media = [
-        InputMediaPhoto(media=io.BytesIO(data), caption=caption if i == 0 else None)
-        for i, data in enumerate(blobs)
-    ]
-
-    try:
-        await bot.send_media_group(
-            chat_id=chat_id, media=media, reply_to_message_id=reply_to_message_id
-        )
-        return len(media)
-    except Exception as e:
-        print(f"[images] send_media_group failed: {e}")
-        # Albums are all-or-nothing, so one bad file loses the whole set -
-        # fall back to sending them individually from the raw bytes.
-        sent = 0
-        for data in blobs:
-            try:
-                await bot.send_photo(chat_id=chat_id, photo=io.BytesIO(data))
-                sent += 1
-            except Exception:
-                continue
-        return sent
+    return sent
 
 
 # ---------------------- REAL CURRENT TIME (deterministic, no guessing) ----------------------
