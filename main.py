@@ -1194,11 +1194,11 @@ async def images_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
-    results = await search_images(query, 5)
+    results = await search_images(query, MAX_IMAGES_PER_BATCH)
     sent = await send_image_batch(
         context.bot,
         chat_id,
-        {"query": query, "results": results, "count": 5},
+        {"query": query, "results": results, "count": MAX_IMAGES_PER_BATCH},
         reply_to_message_id=update.message.message_id,
     )
     if not sent:
@@ -1471,29 +1471,50 @@ async def fetch_page(url: str) -> str:
 # "Ask about a bacterium, get a set of real photos back" - the model picks a
 # proper English search query itself via the search_images tool, so this works
 # like a real assistant researching images rather than a dumb keyword lookup.
-MAX_IMAGES_PER_BATCH = 6  # Telegram allows 10 per album; 6 keeps it fast and tidy
+MAX_IMAGES_PER_BATCH = 3  # was 6 - kept low so "show me a picture" doesn't flood the chat
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # skip anything huge - Telegram rejects it anyway
+TOTAL_IMAGES_PER_REPLY = 4  # hard cap across every batch in a single AI reply
 
 
 def _ddg_images_sync(query: str, max_results: int = 5) -> list:
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=max_results))
+            # type_image="photo" filters out clipart/icons/line-art, which is
+            # where most of the "totally unrelated picture" results come
+            # from; safesearch="moderate" also seems to correlate with more
+            # on-topic results than the unfiltered default.
+            try:
+                results = list(
+                    ddgs.images(
+                        query,
+                        max_results=max_results,
+                        safesearch="moderate",
+                        type_image="photo",
+                    )
+                )
+            except TypeError:
+                # Older/newer ddgs versions may not accept these kwargs.
+                results = list(ddgs.images(query, max_results=max_results))
     except Exception as e:
         print(f"[images] search failed for '{query}': {e}")
         return []
     cleaned = []
+    query_words = {w for w in re.findall(r"[a-zA-Z]{3,}", query.lower())}
+    scored = []
     for r in results:
         url = r.get("image") or r.get("thumbnail")
         if not url:
             continue
-        cleaned.append(
-            {
-                "url": url,
-                "title": (r.get("title") or "").strip()[:150],
-                "source": r.get("url") or "",
-            }
-        )
+        title = (r.get("title") or "").strip()[:150]
+        # Cheap relevance check: how many of the query's words actually show
+        # up in the result's own title. Results with zero overlap are pushed
+        # to the back instead of dropped outright, since some genuinely
+        # relevant images just have unhelpful titles.
+        title_words = set(re.findall(r"[a-zA-Z]{3,}", title.lower()))
+        overlap = len(query_words & title_words) if query_words else 0
+        scored.append((overlap, {"url": url, "title": title, "source": r.get("url") or ""}))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    cleaned = [item for _, item in scored]
     return cleaned
 
 
@@ -1722,11 +1743,13 @@ TOOLS = [
             "description": (
                 "Search the web for real photos and send them to the user as "
                 "actual Telegram images. Use this for any 'show me / picture of "
-                "/ what does X look like / عکس X' request, and whenever a set of "
-                "pictures would genuinely help. Write a specific, descriptive "
-                "English query (e.g. 'bacteria under microscope photograph', not "
-                "just 'bacteria'). You may call it more than once with different "
-                "queries to cover different aspects of the subject."
+                "/ what does X look like / عکس X' request. Write a specific, "
+                "descriptive English query (e.g. 'bacteria under microscope "
+                "photograph', not just 'bacteria') - a vague query is the main "
+                "reason irrelevant pictures get sent. Call this AT MOST ONCE per "
+                "reply, for one subject at a time; do not call it repeatedly to "
+                "cover different aspects, since every call sends more real "
+                "photos to the user's chat."
             ),
             "parameters": {
                 "type": "object",
@@ -1737,7 +1760,12 @@ TOOLS = [
                     },
                     "count": {
                         "type": "integer",
-                        "description": "How many images to send for this query (1-6). Use 3-6 for a normal 'show me X' request.",
+                        "description": (
+                            f"How many images to send (1-{MAX_IMAGES_PER_BATCH}). "
+                            "If the user gave a number ('one picture', 'دو تا عکس'), use exactly that "
+                            "number. Otherwise default to 1-2 - never send more than the user "
+                            "actually needs to see."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -1817,7 +1845,7 @@ async def execute_tool(tool_call, user_id: int, tool_ctx: dict | None = None) ->
         query = (args.get("query") or "").strip()
         if not query:
             return "(هیچ عبارتی برای جستجوی عکس داده نشد.)"
-        count = args.get("count") or 4
+        count = args.get("count") or 2
         results = await search_images(query, count)
         if not results:
             return f"(برای «{query}» عکسی پیدا نشد.)"
@@ -3662,12 +3690,20 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
         await send_ai_reply(update, context, reply_text)
 
     # Any images the model asked for go out after the text, as real photo
-    # albums replying to the user's original message.
+    # albums replying to the user's original message. Hard-capped in total
+    # so a model that ignores the "call this once" instruction still can't
+    # flood the chat with a dozen photos.
+    images_sent_this_reply = 0
     for batch in image_batches:
+        remaining = TOTAL_IMAGES_PER_REPLY - images_sent_this_reply
+        if remaining <= 0:
+            break
+        batch = dict(batch, count=min(batch.get("count", remaining), remaining))
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
         sent = await send_image_batch(
             context.bot, chat_id, batch, reply_to_message_id=update.message.message_id
         )
+        images_sent_this_reply += sent
         if not sent:
             await update.message.reply_text(ui(context, "images_none", query=batch["query"]))
 
