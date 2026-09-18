@@ -1,4 +1,6 @@
 import os
+import hmac
+import hashlib
 import re
 import json
 import io
@@ -13,7 +15,7 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
+from flask import Flask, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
@@ -22,6 +24,8 @@ from telegram import (
     InputTextMessageContent,
     Update,
     BotCommand,
+    WebAppInfo,
+    MenuButtonWebApp,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -68,6 +72,8 @@ TOKEN = os.environ.get("TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 BOT_USERNAME = "@MyBigPotatobot"
+WEBAPP_URL = (os.environ.get("WEBAPP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+WEBAPP_DIR = Path(__file__).parent
 
 if not TOKEN or not GROQ_API_KEY or not GEMINI_API_KEY:
     raise RuntimeError("Missing TOKEN, GROQ_API_KEY, or GEMINI_API_KEY environment variables.")
@@ -916,21 +922,167 @@ def build_system_prompt(
 # ----------------------------------------------------------------------------------------------------------------------
 
 
-# ---------------------- TINY WEB SERVER (keeps Render's free Web Service happy) ----------------------
-# Render's free tier only runs "Web Services" that bind to a port - it has no free
-# always-on Background Worker. This Flask app just answers health-check pings so
-# Render is satisfied, while the real bot logic runs via polling in the background.
+# ---------------------- WEB APP + HEALTH SERVER ----------------------
+# The Flask service also serves the Telegram Mini App and its AI API.
 flask_app = Flask(__name__)
+
+_WEB_HISTORY: dict[int, list] = {}
+_WEB_HISTORY_LOCK = threading.Lock()
+_WEB_CONTEXT_CACHE = {}
+
+
+def _telegram_webapp_user(init_data: str) -> dict | None:
+    """Validate Telegram Mini App initData and return the Telegram user."""
+    if not init_data or not TOKEN:
+        return None
+    try:
+        from urllib.parse import parse_qsl
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = pairs.pop("hash", None)
+        if not received_hash:
+            return None
+        data_check_string = "\n".join(
+            f"{k}={v}" for k, v in sorted(pairs.items())
+        )
+        secret_key = hmac.new(
+            b"WebAppData", TOKEN.encode(), hashlib.sha256
+        ).digest()
+        calculated = hmac.new(
+            secret_key, data_check_string.encode(), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(calculated, received_hash):
+            return None
+        auth_date = int(pairs.get("auth_date", "0"))
+        if auth_date and time.time() - auth_date > 86400:
+            return None
+        user = json.loads(pairs.get("user", "{}"))
+        return user if isinstance(user, dict) and user.get("id") else None
+    except Exception as e:
+        print(f"[webapp] initData validation failed: {e}")
+        return None
+
+
+class _WebContext:
+    def __init__(self):
+        self.user_data = {}
+
+
+def _web_context(user_id: int):
+    with _WEB_HISTORY_LOCK:
+        return _WEB_CONTEXT_CACHE.setdefault(user_id, _WebContext())
 
 
 @flask_app.route("/")
 def health_check():
-    return "Bot is alive", 200
+    return "Potato AI is alive", 200
+
+
+@flask_app.route("/app")
+def web_app():
+    return send_from_directory(WEBAPP_DIR, "index.html")
+
+
+@flask_app.route("/api/chat", methods=["POST"])
+def web_chat():
+    data = request.get_json(silent=True) or {}
+    user = _telegram_webapp_user(data.get("initData", ""))
+    if not user:
+        return jsonify({
+            "ok": False,
+            "error": "Telegram session is missing or expired. Re-open the app from Telegram."
+        }), 401
+
+    message = str(data.get("message", "")).strip()
+    if not message:
+        return jsonify({"ok": False, "error": "Message is empty."}), 400
+    if len(message) > 12000:
+        return jsonify({"ok": False, "error": "Message is too long."}), 400
+
+    user_id = int(user["id"])
+    provider = data.get("provider", "groq")
+    if provider not in ("groq", "gemini", "groq_search", "groq_images"):
+        provider = "groq"
+
+    async def do_chat():
+        ctx = _web_context(user_id)
+
+        # Snapshot the history without holding the lock across network calls.
+        with _WEB_HISTORY_LOCK:
+            history = _WEB_HISTORY.setdefault(user_id, [])
+
+        # Load the same persistent memory/personality used by Telegram.
+        memory_facts = await _get_memory_facts_cached(ctx, user_id)
+        personality = await get_personality(ctx, user_id)
+
+        if provider != "gemini":
+            with _WEB_HISTORY_LOCK:
+                history = _WEB_HISTORY.setdefault(user_id, [])
+                if history and history[0].get("role") == "system":
+                    history[0]["content"] = build_system_prompt(
+                        user_id == OWNER_TELEGRAM_ID,
+                        memory_facts,
+                        personality=personality,
+                    )
+                history.append({"role": "user", "content": message})
+                if len(history) > MAX_HISTORY:
+                    history[:] = [history[0]] + history[-(MAX_HISTORY - 1):]
+
+            image_batches = []
+            tool_ctx = {"chat_id": user_id, "images": image_batches}
+            reply = await run_groq_agent(
+                history,
+                user_id,
+                model=GROQ_MODEL,
+                force_search=(provider == "groq_search"),
+                force_images=(provider == "groq_images"),
+                tool_ctx=tool_ctx,
+            )
+            with _WEB_HISTORY_LOCK:
+                history.append({"role": "assistant", "content": reply})
+            return reply
+
+        # Gemini uses its own system instruction and model-role history.
+        with _WEB_HISTORY_LOCK:
+            history = _WEB_HISTORY.setdefault(user_id, [])
+            history.append({"role": "user", "content": message})
+            compact = [
+                {
+                    "role": ("model" if x["role"] == "assistant" else x["role"]),
+                    "content": x["content"],
+                }
+                for x in history
+                if x["role"] in ("user", "assistant", "model")
+            ]
+            if len(compact) > MAX_HISTORY:
+                compact = compact[-MAX_HISTORY:]
+
+        reply = await call_gemini(
+            compact,
+            build_system_prompt(
+                user_id == OWNER_TELEGRAM_ID,
+                memory_facts,
+                tools_available=False,
+                personality=personality,
+            ),
+        )
+        with _WEB_HISTORY_LOCK:
+            history.append({"role": "model", "content": reply})
+        return reply
+
+    try:
+        reply = asyncio.run(do_chat())
+        return jsonify({"ok": True, "reply": reply})
+    except Exception as e:
+        print(f"[webapp] chat failed for user {user_id}: {e}")
+        return jsonify({
+            "ok": False,
+            "error": "Sorry, the AI request failed. Please try again."
+        }), 500
 
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port, threaded=True)
 
 
 # ---------------------- START MENU ----------------------
@@ -4068,6 +4220,20 @@ async def on_startup(application) -> None:
         )
     except Exception as e:
         print(f"[startup] failed to set command menu: {e}")
+
+    if WEBAPP_URL:
+        try:
+            await application.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Open App",
+                    web_app=WebAppInfo(url=WEBAPP_URL + "/app"),
+                )
+            )
+            print(f"[webapp] Mini App enabled at {WEBAPP_URL}/app")
+        except Exception as e:
+            print(f"[webapp] failed to set Open App menu button: {e}")
+    else:
+        print("[webapp] Set WEBAPP_URL on Render to enable the Telegram Open App button.")
 
 
 # ---------------------- MAIN ----------------------
