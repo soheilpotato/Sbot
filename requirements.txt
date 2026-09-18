@@ -7,3 +7,5 @@ groq
 google-genai
 ddgs
 edge-tts
+langdetect
+pypdf
