@@ -24,7 +24,7 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 from telegram.request import HTTPXRequest
-from groq import Groq, BadRequestError
+from groq import Groq, BadRequestError, APIStatusError
 from google import genai
 from google.genai import types as genai_types
 from ddgs import DDGS  # free web search, no API key / no billing - pip install ddgs
@@ -68,6 +68,81 @@ except ValueError:
 def is_owner(update: Update) -> bool:
     user = update.effective_user
     return OWNER_TELEGRAM_ID is not None and user is not None and user.id == OWNER_TELEGRAM_ID
+
+
+# ---------------------- ADMIN PANEL: LIGHTWEIGHT STATS/USER STORE ----------------------
+# A single JSON file instead of a real database - this is a personal bot
+# with one admin, not something that needs Postgres. It survives normal
+# process restarts. Note: on hosts with an ephemeral filesystem (e.g. a
+# fresh Render deploy), this file can reset - if you need it to survive
+# deploys too, mount a persistent disk and point STATS_FILE at it.
+STATS_FILE = Path(__file__).parent / "bot_stats.json"
+_stats_lock = threading.Lock()
+
+
+def _load_stats() -> dict:
+    if STATS_FILE.exists():
+        try:
+            return json.loads(STATS_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[stats] failed to load {STATS_FILE}, starting fresh: {e}")
+    return {"users": {}, "total_messages": 0, "maintenance": False}
+
+
+def _save_stats() -> None:
+    try:
+        with _stats_lock:
+            STATS_FILE.write_text(json.dumps(BOT_STATS, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[stats] failed to save: {e}")
+
+
+BOT_STATS = _load_stats()
+BOT_STATS.setdefault("users", {})
+BOT_STATS.setdefault("total_messages", 0)
+BOT_STATS.setdefault("maintenance", False)
+BOT_BOOTED_AT = datetime.now(ZoneInfo("UTC"))
+
+
+def record_user_activity(update: Update) -> None:
+    """Called on every incoming update (group=-1, before any other handler)
+    so the admin panel has real numbers to show. Cheap and best-effort -
+    never allowed to break the actual message handling."""
+    try:
+        user = update.effective_user
+        if user is None:
+            return
+        uid = str(user.id)
+        now = datetime.now(ZoneInfo("UTC")).isoformat()
+        entry = BOT_STATS["users"].setdefault(uid, {"first_seen": now, "message_count": 0})
+        entry["username"] = user.username
+        entry["first_name"] = user.first_name
+        entry["last_seen"] = now
+        entry["message_count"] = entry.get("message_count", 0) + 1
+        BOT_STATS["total_messages"] = BOT_STATS.get("total_messages", 0) + 1
+        _save_stats()
+    except Exception as e:
+        print(f"[stats] record_user_activity failed: {e}")
+
+
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    record_user_activity(update)
+
+
+def _format_duration(delta) -> str:
+    total_seconds = int(delta.total_seconds())
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} روز")
+    if hours:
+        parts.append(f"{hours} ساعت")
+    if minutes or not parts:
+        parts.append(f"{minutes} دقیقه")
+    return " و ".join(parts)
+
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 GROQ_MODEL = "openai/gpt-oss-120b"  # check console.groq.com/docs/models - Groq's free lineup changes often
@@ -202,7 +277,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------------------- HELP ----------------------
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(ui(context, "help_text"))
+    text = ui(context, "help_text")
+    if is_owner(update):
+        text += "\n\n🔐 /admin — پنل مدیریت ربات (فقط قابل مشاهده برای تو)"
+    await update.message.reply_text(text)
 
 
 # ---------------------- SHARED MODE-ACTIVATION HELPERS ----------------------
@@ -299,6 +377,9 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     elif query.data.startswith("trlang:"):
         await handle_translate_lang_button(update, context)
+
+    elif query.data.startswith("admin_"):
+        await handle_admin_button(update, context)
 
 
 # ---------------------- STOP AI MODE (optional command) ----------------------
@@ -564,6 +645,49 @@ async def execute_tool(tool_call) -> str:
 # ---------------------- GROQ CALL (with real tool use) ----------------------
 MAX_TOOL_STEPS = 6  # how many search/fetch/time round-trips the model can make per message
 
+# Groq's free tier caps openai/gpt-oss-120b at 8,000 tokens PER MINUTE (this
+# is per Groq's own rate-limit table, not something we control). That cap
+# covers the whole request - system prompt + tool schemas + every message
+# still sitting in this user's history + the reply itself. MAX_HISTORY above
+# only limits the *number* of turns kept, not their size, so a chat can
+# quietly sit right at that ceiling; then even a couple of extra lines from
+# the user tips a single request over 8,000 tokens and Groq answers with a
+# 413 "request too large" error - which is the "works for 2 lines, breaks
+# after that" symptom. GROQ_TOKEN_BUDGET keeps what we actually *send* well
+# under the ceiling, leaving headroom for the tool schemas and the model's
+# own reply (which count against the same per-minute budget).
+GROQ_TOKEN_BUDGET = 4500
+
+
+def _estimate_tokens(text: str) -> int:
+    # No tokenizer dependency - just a deliberately generous estimate (~3
+    # chars/token). Non-Latin scripts like Persian/Arabic tend to tokenize
+    # heavier per character than English, so erring high here is safer than
+    # under-counting and tripping the same 413 we're trying to avoid.
+    return max(1, len(text) // 3)
+
+
+def _trim_messages_to_budget(messages: list, budget: int = GROQ_TOKEN_BUDGET) -> list:
+    """Keep any system message(s) plus as many of the most-recent messages
+    as fit in `budget` estimated tokens, dropping the oldest ones first.
+    Always keeps at least the single most recent message even if it alone
+    is bigger than the budget - there's nothing smaller we can send."""
+    if not messages:
+        return messages
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    other_msgs = [m for m in messages if m.get("role") != "system"]
+
+    used = sum(_estimate_tokens(m.get("content") or "") for m in system_msgs)
+    kept = []
+    for m in reversed(other_msgs):
+        cost = _estimate_tokens(m.get("content") or "")
+        if kept and used + cost > budget:
+            break
+        used += cost
+        kept.append(m)
+    kept.reverse()
+    return system_msgs + kept
+
 # Nudge used for the dedicated search button. This is a *soft* instruction,
 # not a hard API-level constraint: gpt-oss on Groq doesn't reliably obey a
 # forced tool_choice (it can refuse to call the forced tool, or keep trying
@@ -586,13 +710,16 @@ async def run_groq_agent(history: list, model: str = GROQ_MODEL, force_search: b
     # Work on a local copy: the back-and-forth tool-call turns are only needed
     # to produce this one reply and are never saved into the persisted
     # per-user history (that would bloat it fast and isn't needed later).
-    working = list(history)
+    # Trimmed to Groq's per-minute token budget first - see GROQ_TOKEN_BUDGET
+    # above for why this is necessary even though MAX_HISTORY already caps
+    # the number of turns.
+    working = _trim_messages_to_budget(list(history))
     if force_search:
         working = working + [FORCE_SEARCH_HINT]
 
     gathered_info = []  # plain-text notes on what each tool call found
 
-    for _ in range(MAX_TOOL_STEPS):
+    for step in range(MAX_TOOL_STEPS):
         try:
             response = await asyncio.to_thread(
                 groq_client.chat.completions.create,
@@ -601,16 +728,57 @@ async def run_groq_agent(history: list, model: str = GROQ_MODEL, force_search: b
                 tools=TOOLS,
                 tool_choice="auto",
             )
-        except BadRequestError as e:
-            # Groq's gpt-oss endpoint can get into a bad state once a
-            # transcript has several tool-call turns in it - it may keep
-            # trying to emit more tool calls almost regardless of what we
-            # ask for next, and any mismatch throws a 400. Once that
-            # happens, stop asking it for more tools and go straight to the
-            # clean, tool-free final answer below instead of retrying the
-            # same broken pattern.
-            print(f"[run_groq_agent] tool round failed, giving up on tools: {e}")
-            break
+        except APIStatusError as e:
+            status = getattr(e, "status_code", None)
+            if status in (413, 429):
+                # 413 = this single request (system prompt + tool schemas +
+                # history) is bigger than the 8,000 TPM ceiling by itself.
+                # 429 = the account has burned through its per-minute budget
+                # across recent calls. Either way, retrying with the exact
+                # same payload will just fail again - so on the FIRST time
+                # this happens in this loop, cut the context hard and retry
+                # once; only give up if that still doesn't fit.
+                print(f"[run_groq_agent] Groq {status} on step {step}, trimming and retrying: {e}")
+                smaller = _trim_messages_to_budget(working, budget=GROQ_TOKEN_BUDGET // 2)
+                if smaller == working:
+                    # Nothing left to trim (e.g. the user's own message is
+                    # simply too long on its own) - no point retrying.
+                    return (
+                        "پیامت برای این مدل خیلی طولانیه و سقف حجم مجاز رو رد می‌کنه. "
+                        "میشه کوتاه‌ترش کنی یا در چند پیام جدا بفرستیش؟"
+                    )
+                working = smaller
+                try:
+                    response = await asyncio.to_thread(
+                        groq_client.chat.completions.create,
+                        model=model,
+                        messages=working,
+                        tools=TOOLS,
+                        tool_choice="auto",
+                    )
+                except APIStatusError as e2:
+                    print(f"[run_groq_agent] retry after trim also failed: {e2}")
+                    if getattr(e2, "status_code", None) == 429:
+                        return "الان درخواست‌ها به سقف مجاز هوش مصنوعی (Groq) رسیده. یکی-دو دقیقه دیگه دوباره امتحان کن."
+                    return "ببخشید، الان نمی‌تونم جواب بدم. یکم بعد دوباره امتحان کن."
+                msg = response.choices[0].message
+                if not msg.tool_calls:
+                    return msg.content or ""
+                # fall through to normal tool-call handling below with the
+                # smaller `working` list
+            elif isinstance(e, BadRequestError):
+                # Groq's gpt-oss endpoint can get into a bad state once a
+                # transcript has several tool-call turns in it - it may keep
+                # trying to emit more tool calls almost regardless of what we
+                # ask for next, and any mismatch throws a 400. Once that
+                # happens, stop asking it for more tools and go straight to
+                # the clean, tool-free final answer below instead of
+                # retrying the same broken pattern.
+                print(f"[run_groq_agent] tool round failed, giving up on tools: {e}")
+                break
+            else:
+                print(f"[run_groq_agent] unexpected Groq error on step {step}: {e}")
+                raise
 
         msg = response.choices[0].message
 
@@ -662,7 +830,9 @@ async def run_groq_agent(history: list, model: str = GROQ_MODEL, force_search: b
     else:
         final_prompt = original_user_text
 
-    final_messages = history[:-1] + [{"role": "user", "content": final_prompt}]
+    final_messages = _trim_messages_to_budget(
+        history[:-1] + [{"role": "user", "content": final_prompt}]
+    )
 
     try:
         response = await asyncio.to_thread(
@@ -671,6 +841,32 @@ async def run_groq_agent(history: list, model: str = GROQ_MODEL, force_search: b
             messages=final_messages,
         )
         return response.choices[0].message.content or "ببخشید، نتونستم جواب بدم. دوباره امتحان کن."
+    except APIStatusError as e:
+        status = getattr(e, "status_code", None)
+        if status in (413, 429):
+            # Same size/rate ceiling as above, but here there's no cheaper
+            # fallback left to try - trim once more and retry, otherwise
+            # give a message that actually explains what happened instead
+            # of a generic failure.
+            smaller = _trim_messages_to_budget(final_messages, budget=GROQ_TOKEN_BUDGET // 2)
+            if smaller != final_messages:
+                try:
+                    response = await asyncio.to_thread(
+                        groq_client.chat.completions.create,
+                        model=model,
+                        messages=smaller,
+                    )
+                    return response.choices[0].message.content or "ببخشید، نتونستم جواب بدم. دوباره امتحان کن."
+                except Exception as e2:
+                    print(f"[run_groq_agent] final trimmed retry also failed: {e2}")
+            if status == 429:
+                return "الان درخواست‌ها به سقف مجاز هوش مصنوعی (Groq) رسیده. یکی-دو دقیقه دیگه دوباره امتحان کن."
+            return (
+                "پیامت (یا تاریخچه‌ی گفتگو) برای این مدل خیلی طولانیه. "
+                "میشه کوتاه‌ترش کنی یا با /groq یه گفتگوی تازه شروع کنی؟"
+            )
+        print(f"[run_groq_agent] final plain-text attempt also failed: {e}")
+        return "ببخشید، الان نمی‌تونم جواب بدم. یکم بعد دوباره امتحان کن."
     except Exception as e:
         print(f"[run_groq_agent] final plain-text attempt also failed: {e}")
         return "ببخشید، الان نمی‌تونم جواب بدم. یکم بعد دوباره امتحان کن."
@@ -1664,6 +1860,14 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
     chat_id = update.effective_chat.id
     owner = is_owner(update)
 
+    # Maintenance mode (toggled from the admin panel) pauses the bot for
+    # everyone except the owner, e.g. while you're debugging or redeploying.
+    if BOT_STATS.get("maintenance") and not owner:
+        await update.message.reply_text(
+            "ربات موقتاً در حالت تعمیره و به‌زودی برمی‌گرده. لطفاً یکم بعد دوباره امتحان کن. 🌸"
+        )
+        return
+
     if provider == "translate":
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         target_code = context.user_data.get("translate_target", "auto")
@@ -1766,9 +1970,204 @@ async def _handle_ai_failure(
     await update.message.reply_text(ui(context, "ai_call_fail"))
 
 
+# ---------------------- ADMIN PANEL (owner only) ----------------------
+# Everything here is gated by is_owner() at every entry point (command AND
+# every button callback) - not just by hiding the /admin command from
+# everyone else's /help. Even if another user somehow guesses "/admin" or a
+# button's callback_data, they hit the same is_owner() check and get nothing.
+ADMIN_USERS_PAGE_SIZE = 15
+
+
+def build_admin_menu_keyboard() -> InlineKeyboardMarkup:
+    maintenance_on = BOT_STATS.get("maintenance", False)
+    keyboard = [
+        [InlineKeyboardButton("📊 آمار ربات", callback_data="admin_stats")],
+        [InlineKeyboardButton("👤 اطلاعات من", callback_data="admin_myinfo")],
+        [InlineKeyboardButton("👥 لیست کاربران", callback_data="admin_users:0")],
+        [InlineKeyboardButton("📢 پیام همگانی", callback_data="admin_broadcast_start")],
+        [
+            InlineKeyboardButton(
+                "🛑 خاموش کردن حالت تعمیر" if maintenance_on else "🛠 روشن کردن حالت تعمیر",
+                callback_data="admin_maintenance_toggle",
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Deliberately silent (no "you're not allowed" reply) for non-owners -
+    # no reason to even confirm this command does something.
+    if not is_owner(update):
+        return
+    await update.message.reply_text(
+        "🔐 پنل مدیریت ربات\nیکی از گزینه‌ها رو انتخاب کن:",
+        reply_markup=build_admin_menu_keyboard(),
+    )
+
+
+def _render_admin_stats_text() -> str:
+    users = BOT_STATS.get("users", {})
+    uptime = _format_duration(datetime.now(ZoneInfo("UTC")) - BOT_BOOTED_AT)
+    maintenance = "روشن 🛑" if BOT_STATS.get("maintenance") else "خاموش ✅"
+    top = sorted(users.items(), key=lambda kv: kv[1].get("message_count", 0), reverse=True)[:5]
+    top_lines = [
+        f"  • {('@' + info['username']) if info.get('username') else (info.get('first_name') or uid)} — {info.get('message_count', 0)} پیام"
+        for uid, info in top
+    ]
+    top_block = "\n".join(top_lines) if top_lines else "  (هنوز کسی پیام نداده)"
+    return (
+        "📊 آمار ربات\n\n"
+        f"تعداد کاربران: {len(users)}\n"
+        f"کل پیام‌های پردازش‌شده: {BOT_STATS.get('total_messages', 0)}\n"
+        f"مدت روشن بودن (از آخرین ری‌استارت): {uptime}\n"
+        f"حالت تعمیر: {maintenance}\n\n"
+        f"فعال‌ترین کاربران:\n{top_block}"
+    )
+
+
+def _render_admin_myinfo_text(update: Update) -> str:
+    user = update.effective_user
+    chat = update.effective_chat
+    lines = [
+        "👤 اطلاعات تلگرام تو (مالک ربات)\n",
+        f"آیدی عددی: {user.id}",
+        f"یوزرنیم: @{user.username}" if user.username else "یوزرنیم: (نداره)",
+        f"نام: {(user.first_name or '') + ' ' + (user.last_name or '')}".strip(),
+        f"زبان تلگرام: {user.language_code or 'نامشخص'}",
+        f"حساب پرمیوم: {'بله' if getattr(user, 'is_premium', False) else 'خیر'}",
+        f"آیدی این چت: {chat.id}",
+    ]
+    return "\n".join(lines)
+
+
+def _render_admin_users_page(page: int):
+    users = BOT_STATS.get("users", {})
+    items = sorted(users.items(), key=lambda kv: kv[1].get("last_seen", ""), reverse=True)
+    start = page * ADMIN_USERS_PAGE_SIZE
+    page_items = items[start : start + ADMIN_USERS_PAGE_SIZE]
+    total_pages = max(1, (len(items) + ADMIN_USERS_PAGE_SIZE - 1) // ADMIN_USERS_PAGE_SIZE)
+
+    if not page_items:
+        text = "👥 هنوز هیچ کاربری با ربات صحبت نکرده."
+    else:
+        lines = [f"👥 لیست کاربران (صفحه {page + 1} از {total_pages})\n"]
+        for uid, info in page_items:
+            label = f"@{info['username']}" if info.get("username") else (info.get("first_name") or "بدون نام")
+            lines.append(f"• {label} — آیدی: {uid} — {info.get('message_count', 0)} پیام")
+        text = "\n".join(lines)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("« قبلی", callback_data=f"admin_users:{page - 1}"))
+    if start + ADMIN_USERS_PAGE_SIZE < len(items):
+        nav_row.append(InlineKeyboardButton("بعدی »", callback_data=f"admin_users:{page + 1}"))
+    keyboard = ([nav_row] if nav_row else []) + [
+        [InlineKeyboardButton("« برگشت به پنل", callback_data="admin_menu")]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+BACK_TO_ADMIN_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("« برگشت به پنل", callback_data="admin_menu")]]
+)
+
+
+async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not is_owner(update):
+        # A popup only this (non-owner) user sees, so we're not silently
+        # editing someone else's message into an admin screen.
+        await query.answer("این بخش فقط برای مالک رباته.", show_alert=True)
+        return
+
+    data = query.data
+
+    if data == "admin_menu":
+        await query.edit_message_text(
+            "🔐 پنل مدیریت ربات\nیکی از گزینه‌ها رو انتخاب کن:",
+            reply_markup=build_admin_menu_keyboard(),
+        )
+
+    elif data == "admin_stats":
+        await query.edit_message_text(_render_admin_stats_text(), reply_markup=BACK_TO_ADMIN_KEYBOARD)
+
+    elif data == "admin_myinfo":
+        await query.edit_message_text(_render_admin_myinfo_text(update), reply_markup=BACK_TO_ADMIN_KEYBOARD)
+
+    elif data.startswith("admin_users:"):
+        page = int(data.split(":", 1)[1])
+        text, markup = _render_admin_users_page(page)
+        await query.edit_message_text(text, reply_markup=markup)
+
+    elif data == "admin_maintenance_toggle":
+        BOT_STATS["maintenance"] = not BOT_STATS.get("maintenance", False)
+        _save_stats()
+        state_text = (
+            "روشنه 🛑 (بقیه‌ی کاربرا فعلاً نمی‌تونن از ربات استفاده کنن)"
+            if BOT_STATS["maintenance"]
+            else "خاموشه ✅ (همه می‌تونن عادی استفاده کنن)"
+        )
+        await query.edit_message_text(f"حالت تعمیر الان {state_text}", reply_markup=BACK_TO_ADMIN_KEYBOARD)
+
+    elif data == "admin_broadcast_start":
+        context.user_data["awaiting_broadcast"] = True
+        await query.edit_message_text(
+            "متنی که می‌خوای برای همه‌ی کاربرا "
+            f"(فعلاً {len(BOT_STATS.get('users', {}))} نفر) ارسال بشه رو بفرست.\n"
+            "برای لغو، دکمه‌ی لغو رو تو مرحله‌ی بعد بزن."
+        )
+
+    elif data == "admin_broadcast_send":
+        text = context.user_data.pop("broadcast_pending", None)
+        if not text:
+            await query.edit_message_text("پیامی برای ارسال پیدا نشد - دوباره از پنل شروع کن.")
+            return
+        await query.edit_message_text("در حال ارسال... ⏳")
+        sent, failed = 0, 0
+        for uid in list(BOT_STATS.get("users", {}).keys()):
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=text)
+                sent += 1
+            except Exception as e:
+                failed += 1
+                print(f"[broadcast] failed to message {uid}: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ پیام همگانی ارسال شد.\nموفق: {sent}\nناموفق (مثلاً ربات رو بلاک کردن): {failed}",
+        )
+
+    elif data == "admin_broadcast_cancel":
+        context.user_data.pop("broadcast_pending", None)
+        context.user_data.pop("awaiting_broadcast", None)
+        await query.edit_message_text("پیام همگانی لغو شد.")
+
+
 # ---------------------- MAIN TEXT ROUTER ----------------------
 # This decides what to do with a plain text message depending on user's current mode
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Owner mid-broadcast-flow: this message is the broadcast text itself,
+    # not a normal AI-mode message. Checked before ai_mode so it can't be
+    # accidentally swallowed by whatever provider is currently active.
+    if is_owner(update) and context.user_data.get("awaiting_broadcast"):
+        context.user_data["awaiting_broadcast"] = False
+        text = update.message.text
+        context.user_data["broadcast_pending"] = text
+        preview = text if len(text) <= 500 else text[:500] + "…"
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ ارسال", callback_data="admin_broadcast_send"),
+                    InlineKeyboardButton("❌ لغو", callback_data="admin_broadcast_cancel"),
+                ]
+            ]
+        )
+        await update.message.reply_text(
+            f"پیش‌نمایش پیام همگانی برای {len(BOT_STATS.get('users', {}))} کاربر:\n\n{preview}",
+            reply_markup=keyboard,
+        )
+        return
+
     if context.user_data.get("ai_mode"):
         await ai_handler(update, context, update.message.text)
         return
@@ -1830,9 +2229,16 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("translate", translate_command))
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("lang", language_command))  # short alias
+    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_handler(MessageHandler(filters.VOICE, voice_handler))
     app.add_error_handler(error_handler)
+
+    # group=-1 runs before every other handler above, on every update that
+    # has an effective_user - this is what feeds real numbers to the admin
+    # panel's stats/user-list, without touching any of the actual feature logic.
+    app.add_handler(MessageHandler(filters.ALL, track_activity), group=-1)
+    app.add_handler(CallbackQueryHandler(track_activity), group=-1)
 
     app.run_polling()
