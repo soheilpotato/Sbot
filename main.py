@@ -474,6 +474,7 @@ REPEAT_INTERVALS = {
 # Set in __main__ so background helpers (tool calls, job callbacks) can reach
 # the running Application without it being threaded through every function.
 BOT_APP = None
+BOT_LOOP = None
 
 
 def _load_reminders() -> list:
@@ -1000,11 +1001,13 @@ def web_chat():
 
     user_id = int(user["id"])
     provider = data.get("provider", "groq")
-    if provider not in ("groq", "gemini", "groq_search", "groq_images"):
+    if provider not in ("groq", "gemini", "groq_search", "groq_images", "translate"):
         provider = "groq"
 
     async def do_chat():
         ctx = _web_context(user_id)
+        if ctx.user_data.get("ai_off"):
+            raise PermissionError("AI mode is turned off. Use Start AI in Settings to turn it back on.")
 
         # Snapshot the history without holding the lock across network calls.
         with _WEB_HISTORY_LOCK:
@@ -1013,6 +1016,11 @@ def web_chat():
         # Load the same persistent memory/personality used by Telegram.
         memory_facts = await _get_memory_facts_cached(ctx, user_id)
         personality = await get_personality(ctx, user_id)
+
+        if provider == "translate":
+            target = ctx.user_data.get("translate_target", data.get("target", "auto"))
+            reply = await translate_text(message, target)
+            return reply, []
 
         if provider != "gemini":
             with _WEB_HISTORY_LOCK:
@@ -1039,7 +1047,7 @@ def web_chat():
             )
             with _WEB_HISTORY_LOCK:
                 history.append({"role": "assistant", "content": reply})
-            return reply
+            return reply, image_batches
 
         # Gemini uses its own system instruction and model-role history.
         with _WEB_HISTORY_LOCK:
@@ -1067,11 +1075,13 @@ def web_chat():
         )
         with _WEB_HISTORY_LOCK:
             history.append({"role": "model", "content": reply})
-        return reply
+        return reply, []
 
     try:
-        reply = asyncio.run(do_chat())
-        return jsonify({"ok": True, "reply": reply})
+        reply, images = asyncio.run(do_chat())
+        return jsonify({"ok": True, "reply": reply, "images": images})
+    except PermissionError as e:
+        return jsonify({"ok": False, "error": str(e)}), 403
     except Exception as e:
         print(f"[webapp] chat failed for user {user_id}: {e}")
         return jsonify({
@@ -1079,6 +1089,328 @@ def web_chat():
             "error": "Sorry, the AI request failed. Please try again."
         }), 500
 
+
+
+# ---------------------- MINI APP FEATURE API ----------------------
+def _web_user_or_401(data):
+    user = _telegram_webapp_user(data.get("initData", "")) if isinstance(data, dict) else None
+    return user
+
+
+def _run_on_bot_loop(coro):
+    """Run a coroutine on python-telegram-bot's real event loop from Flask."""
+    if BOT_LOOP is not None and BOT_LOOP.is_running():
+        future = asyncio.run_coroutine_threadsafe(coro, BOT_LOOP)
+        return future.result(timeout=90)
+    return asyncio.run(coro)
+
+
+def _web_public_personality(data: dict) -> dict:
+    preset = data.get("preset", DEFAULT_PERSONALITY)
+    return {
+        "preset": preset,
+        "custom": data.get("custom", ""),
+        "options": [
+            {"code": code, "label": personality_label(code, "en")}
+            for code in PERSONALITY_PRESETS
+        ] + [{"code": "custom", "label": "✍️ Custom"}],
+    }
+
+
+@flask_app.route("/api/state", methods=["POST"])
+def web_state():
+    data = request.get_json(silent=True) or {}
+    user = _web_user_or_401(data)
+    if not user:
+        return jsonify({"ok": False, "error": "Telegram session is missing or expired. Re-open the app from Telegram."}), 401
+    user_id = int(user["id"])
+    ctx = _web_context(user_id)
+    try:
+        personality = _run_on_bot_loop(get_personality(ctx, user_id))
+        reminders = _user_reminders(user_id)
+        return jsonify({
+            "ok": True,
+            "user": {"id": user_id, "first_name": user.get("first_name", ""), "username": user.get("username", "")},
+            "is_owner": user_id == OWNER_TELEGRAM_ID,
+            "provider": ctx.user_data.get("ai_provider", "groq"),
+            "ai_mode": bool(ctx.user_data.get("ai_mode", True)) and not bool(ctx.user_data.get("ai_off", False)),
+            "ui_language": ctx.user_data.get("ui_lang", "en"),
+            "translate_target": ctx.user_data.get("translate_target", "auto"),
+            "personality": _web_public_personality(personality),
+            "reminders": [
+                {"id": r["id"], "text": r["text"], "due_ts": r["due_ts"], "repeat": r.get("repeat", "none"), "tz": r.get("tz", "Asia/Tehran"), "when": format_reminder_time(r)}
+                for r in reminders
+            ],
+            "has_pdf": bool(ctx.user_data.get("pdf_doc")),
+            "pdf": ({"name": ctx.user_data["pdf_doc"]["name"], "pages": ctx.user_data["pdf_doc"]["pages"]} if ctx.user_data.get("pdf_doc") else None),
+            "languages": [{"code": c, "label": info["label"], "name": info["name"]} for c, info in LANGUAGES.items()],
+            "ui_languages": [{"code": c, "label": LANGUAGES[c]["label"]} for c in UI_LANGUAGES],
+            "repeat_options": ["none", "hourly", "daily", "weekly"],
+        })
+    except Exception as e:
+        print(f"[webapp] state failed: {e}")
+        return jsonify({"ok": False, "error": "Could not load your settings."}), 500
+
+
+@flask_app.route("/api/settings", methods=["POST"])
+def web_settings():
+    data = request.get_json(silent=True) or {}
+    user = _web_user_or_401(data)
+    if not user:
+        return jsonify({"ok": False, "error": "Telegram session is missing or expired. Re-open the app from Telegram."}), 401
+    user_id = int(user["id"])
+    ctx = _web_context(user_id)
+    action = data.get("action", "")
+
+    async def do_settings():
+        if action == "provider":
+            provider = data.get("provider", "groq")
+            if provider not in ("groq", "gemini", "groq_search", "groq_images"):
+                raise ValueError("Invalid provider")
+            ctx.user_data["ai_off"] = False
+            ctx.user_data["ai_mode"] = True
+            ctx.user_data["ai_provider"] = provider
+            return {"provider": provider, "ai_mode": True}
+        if action == "stop":
+            ctx.user_data["ai_mode"] = False
+            ctx.user_data["ai_off"] = True
+            return {"ai_mode": False}
+        if action == "start":
+            ctx.user_data["ai_off"] = False
+            ctx.user_data["ai_mode"] = True
+            ctx.user_data.setdefault("ai_provider", "groq")
+            return {"ai_mode": True, "provider": ctx.user_data["ai_provider"]}
+        if action == "translate_target":
+            target = str(data.get("target", "auto"))
+            if target != "auto" and target not in LANGUAGES:
+                target = target[:80]
+            ctx.user_data["translate_target"] = target
+            ctx.user_data["ai_provider"] = "translate"
+            ctx.user_data["ai_mode"] = True
+            ctx.user_data["ai_off"] = False
+            return {"translate_target": target, "provider": "translate"}
+        if action == "ui_language":
+            lang = str(data.get("language", "en"))
+            if lang not in UI_LANGUAGES:
+                raise ValueError("Unsupported interface language")
+            ctx.user_data["ui_lang"] = lang
+            return {"ui_language": lang}
+        if action == "personality":
+            code = str(data.get("preset", "cute"))
+            custom = str(data.get("custom", ""))
+            if code not in PERSONALITY_PRESETS and code != "custom":
+                raise ValueError("Unsupported personality")
+            if code == "custom" and not custom.strip():
+                raise ValueError("Custom personality is empty")
+            await set_personality(ctx, user_id, code, custom if code == "custom" else "")
+            return {"personality": _web_public_personality(ctx.user_data.get("_personality", {}))}
+        if action == "clear_pdf":
+            had = ctx.user_data.pop("pdf_doc", None)
+            return {"has_pdf": False, "cleared": bool(had)}
+        raise ValueError("Unknown settings action")
+
+    try:
+        result = _run_on_bot_loop(do_settings())
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[webapp] settings failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@flask_app.route("/api/translate", methods=["POST"])
+def web_translate():
+    data = request.get_json(silent=True) or {}
+    user = _web_user_or_401(data)
+    if not user:
+        return jsonify({"ok": False, "error": "Telegram session is missing or expired."}), 401
+    text = str(data.get("message", "")).strip()
+    if not text:
+        return jsonify({"ok": False, "error": "Text is empty."}), 400
+    target = str(data.get("target", "auto"))
+    if target != "auto" and target not in LANGUAGES:
+        target = target[:80]
+    try:
+        translated = _run_on_bot_loop(translate_text(text, target))
+        return jsonify({"ok": True, "reply": translated, "target": target})
+    except Exception as e:
+        print(f"[webapp] translation failed: {e}")
+        return jsonify({"ok": False, "error": "Translation failed. Please try again."}), 500
+
+
+@flask_app.route("/api/reminders", methods=["POST"])
+def web_reminders():
+    data = request.get_json(silent=True) or {}
+    user = _web_user_or_401(data)
+    if not user:
+        return jsonify({"ok": False, "error": "Telegram session is missing or expired."}), 401
+    user_id = int(user["id"])
+    action = data.get("action", "list")
+    ctx = _web_context(user_id)
+    try:
+        if action == "list":
+            items = _user_reminders(user_id)
+            return jsonify({"ok": True, "reminders": [{"id": r["id"], "text": r["text"], "due_ts": r["due_ts"], "repeat": r.get("repeat", "none"), "tz": r.get("tz", "Asia/Tehran"), "when": format_reminder_time(r)} for r in items]})
+        if action == "delete":
+            rid = str(data.get("id", ""))
+            items = _user_reminders(user_id)
+            if not any(r["id"] == rid for r in items):
+                return jsonify({"ok": False, "error": "Reminder not found."}), 404
+            async def do_delete_reminder():
+                cancel_reminder_job(rid)
+                await asyncio.to_thread(_delete_reminder, rid)
+            _run_on_bot_loop(do_delete_reminder())
+            return jsonify({"ok": True})
+        if action == "add":
+            if BOT_APP is None or BOT_APP.job_queue is None:
+                return jsonify({"ok": False, "error": "Reminders are unavailable because JobQueue is not installed."}), 503
+            text = str(data.get("text", "")).strip()
+            if not text:
+                return jsonify({"ok": False, "error": "Reminder text is empty."}), 400
+            repeat = str(data.get("repeat", "none"))
+            tz = str(data.get("tz", "Asia/Tehran"))
+            when_type = str(data.get("when_type", "delay"))
+            if when_type == "clock":
+                due_ts = next_clock_time(str(data.get("clock", "")), tz)
+            else:
+                try:
+                    seconds = int(data.get("seconds", 0))
+                except Exception:
+                    seconds = 0
+                due_ts = time.time() + seconds if seconds > 0 else None
+            if due_ts is None:
+                return jsonify({"ok": False, "error": "Enter a valid time."}), 400
+            # add_reminder + JobQueue must run on the bot's own event loop.
+            reminder = _run_on_bot_loop(add_reminder(user_id, user_id, text, due_ts, repeat, tz))
+            if reminder is None:
+                return jsonify({"ok": False, "error": f"You can have up to {MAX_REMINDERS_PER_USER} reminders."}), 400
+            return jsonify({"ok": True, "reminder": {"id": reminder["id"], "text": reminder["text"], "due_ts": reminder["due_ts"], "repeat": reminder["repeat"], "tz": reminder["tz"], "when": format_reminder_time(reminder)}})
+        return jsonify({"ok": False, "error": "Unknown reminder action."}), 400
+    except Exception as e:
+        print(f"[webapp] reminder failed: {e}")
+        return jsonify({"ok": False, "error": "Reminder operation failed."}), 500
+
+
+@flask_app.route("/api/tts", methods=["POST"])
+def web_tts():
+    data = request.get_json(silent=True) or {}
+    user = _web_user_or_401(data)
+    if not user:
+        return jsonify({"ok": False, "error": "Telegram session is missing or expired."}), 401
+    text = str(data.get("text", "")).strip()
+    if not text:
+        return jsonify({"ok": False, "error": "Text is empty."}), 400
+    if len(text) > 12000:
+        return jsonify({"ok": False, "error": "Text is too long."}), 400
+    try:
+        audio = _run_on_bot_loop(synthesize_speech(text))
+        from flask import Response
+        return Response(audio, mimetype="audio/ogg", headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        print(f"[webapp] tts failed: {e}")
+        return jsonify({"ok": False, "error": "Voice generation failed."}), 500
+
+
+@flask_app.route("/api/voice", methods=["POST"])
+def web_voice():
+    init_data = request.form.get("initData", "")
+    user = _telegram_webapp_user(init_data)
+    if not user:
+        return jsonify({"ok": False, "error": "Telegram session is missing or expired."}), 401
+    audio = request.files.get("audio")
+    if not audio:
+        return jsonify({"ok": False, "error": "No audio was uploaded."}), 400
+    try:
+        raw = audio.read()
+        if len(raw) > 10 * 1024 * 1024:
+            return jsonify({"ok": False, "error": "Voice file is too large."}), 400
+        text = _run_on_bot_loop(transcribe_voice(raw))
+        if not text:
+            return jsonify({"ok": False, "error": "No speech was detected."}), 400
+        return jsonify({"ok": True, "text": text})
+    except Exception as e:
+        print(f"[webapp] voice transcription failed: {e}")
+        return jsonify({"ok": False, "error": "Voice transcription failed."}), 500
+
+
+@flask_app.route("/api/pdf", methods=["POST"])
+def web_pdf():
+    init_data = request.form.get("initData", "")
+    user = _telegram_webapp_user(init_data)
+    if not user:
+        return jsonify({"ok": False, "error": "Telegram session is missing or expired."}), 401
+    user_id = int(user["id"])
+    ctx = _web_context(user_id)
+    action = request.form.get("action", "upload")
+    if action == "clear":
+        had = ctx.user_data.pop("pdf_doc", None)
+        return jsonify({"ok": True, "has_pdf": False, "cleared": bool(had)})
+    if PdfReader is None:
+        return jsonify({"ok": False, "error": "PDF support is not installed on the server."}), 503
+    upload = request.files.get("file")
+    if not upload:
+        return jsonify({"ok": False, "error": "Choose a PDF file first."}), 400
+    name = upload.filename or "document.pdf"
+    if not name.lower().endswith(".pdf"):
+        return jsonify({"ok": False, "error": "Only PDF files are supported."}), 400
+    raw = upload.read()
+    if len(raw) > MAX_PDF_BYTES:
+        return jsonify({"ok": False, "error": "The PDF is too large (20 MB max)."}), 400
+    try:
+        text, pages = awaitable_result = _run_on_bot_loop(asyncio.to_thread(_extract_pdf_text_sync, raw))
+        if not text.strip():
+            return jsonify({"ok": False, "error": "This PDF has no selectable text. Scanned PDFs are not supported."}), 400
+        ctx.user_data["pdf_doc"] = {"name": name, "pages": pages, "chunks": _chunk_text(text)}
+        ctx.user_data["ai_provider"] = "groq"
+        ctx.user_data["ai_mode"] = True
+        ctx.user_data["ai_off"] = False
+        return jsonify({"ok": True, "has_pdf": True, "pdf": {"name": name, "pages": pages}})
+    except Exception as e:
+        print(f"[webapp] pdf failed: {e}")
+        return jsonify({"ok": False, "error": "Could not read this PDF."}), 500
+
+
+@flask_app.route("/api/admin", methods=["POST"])
+def web_admin():
+    data = request.get_json(silent=True) or {}
+    user = _web_user_or_401(data)
+    if not user or int(user.get("id", 0)) != OWNER_TELEGRAM_ID:
+        return jsonify({"ok": False, "error": "Admin access denied."}), 403
+    action = data.get("action", "stats")
+    try:
+        if action == "stats":
+            users = BOT_STATS.get("users", {})
+            top = sorted(users.items(), key=lambda kv: kv[1].get("message_count", 0), reverse=True)[:10]
+            return jsonify({"ok": True, "users": len(users), "total_messages": BOT_STATS.get("total_messages", 0), "maintenance": bool(BOT_STATS.get("maintenance")), "top_users": [{"id": uid, "name": info.get("username") or info.get("first_name") or uid, "messages": info.get("message_count", 0)} for uid, info in top]})
+        if action == "maintenance":
+            BOT_STATS["maintenance"] = bool(data.get("enabled"))
+            _run_on_bot_loop(asyncio.to_thread(_save_stats))
+            return jsonify({"ok": True, "maintenance": BOT_STATS["maintenance"]})
+        if action == "users":
+            users = BOT_STATS.get("users", {})
+            rows = []
+            for uid, info in sorted(users.items(), key=lambda kv: kv[1].get("last_seen", ""), reverse=True):
+                rows.append({"id": uid, "name": info.get("username") or info.get("first_name") or uid, "messages": info.get("message_count", 0), "last_seen": info.get("last_seen", "")})
+            return jsonify({"ok": True, "users": rows})
+        if action == "broadcast":
+            text = str(data.get("text", "")).strip()
+            if not text:
+                return jsonify({"ok": False, "error": "Broadcast text is empty."}), 400
+            async def do_broadcast():
+                sent = failed = 0
+                for uid in list(BOT_STATS.get("users", {}).keys()):
+                    try:
+                        await BOT_APP.bot.send_message(chat_id=int(uid), text=text, parse_mode=None)
+                        sent += 1
+                    except Exception as e:
+                        failed += 1
+                        print(f"[webapp admin broadcast] failed for {uid}: {e}")
+                return sent, failed
+            sent, failed = _run_on_bot_loop(do_broadcast())
+            return jsonify({"ok": True, "sent": sent, "failed": failed})
+        return jsonify({"ok": False, "error": "Unknown admin action."}), 400
+    except Exception as e:
+        print(f"[webapp] admin failed: {e}")
+        return jsonify({"ok": False, "error": "Admin operation failed."}), 500
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -4189,6 +4521,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ---------------------- STARTUP HOOK ----------------------
 async def on_startup(application) -> None:
+    global BOT_LOOP
+    BOT_LOOP = asyncio.get_running_loop()
     # Scheduled jobs only live in RAM, so every restart has to re-register the
     # reminders that are still stored in Upstash - otherwise a redeploy would
     # silently kill everybody's reminders while still showing them in
