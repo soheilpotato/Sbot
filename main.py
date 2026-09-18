@@ -4590,13 +4590,13 @@ if __name__ == "__main__":
     # a response" hiccup (a pooled connection going stale is a normal,
     # self-recovering network event Telegram/httpx both retry around), but
     # it does make it noticeably rarer.
-    request = HTTPXRequest(connection_pool_size=20, connect_timeout=15.0, read_timeout=20.0, write_timeout=20.0, pool_timeout=10.0)
+    telegram_request = HTTPXRequest(connection_pool_size=20, connect_timeout=15.0, read_timeout=20.0, write_timeout=20.0, pool_timeout=10.0)
     get_updates_request = HTTPXRequest(connection_pool_size=4, connect_timeout=15.0, read_timeout=40.0, pool_timeout=10.0)
 
     app = (
         ApplicationBuilder()
         .token(TOKEN)
-        .request(request)
+        .request(telegram_request)
         .get_updates_request(get_updates_request)
         .post_init(on_startup)
         .build()
