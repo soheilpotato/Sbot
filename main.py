@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import io
 import time
@@ -6,7 +7,7 @@ import uuid
 import subprocess
 import threading
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -14,7 +15,15 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputMediaPhoto,
+    InputTextMessageContent,
+    Update,
+    BotCommand,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -23,6 +32,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
     CallbackQueryHandler,
+    InlineQueryHandler,
 )
 from telegram.request import HTTPXRequest
 from groq import Groq, BadRequestError, APIStatusError
@@ -40,6 +50,15 @@ try:
     DetectorFactory.seed = 0  # deterministic results across runs
 except ImportError:  # pragma: no cover
     _langdetect_detect = None
+
+# PDF reading (the "send me a PDF and ask questions about it" feature).
+# Pure-Python, no API key - pip install pypdf. The bot still boots without
+# it; PDF uploads just get a "this feature isn't installed" reply instead of
+# crashing, so a missing dependency can never take the whole bot down.
+try:
+    from pypdf import PdfReader
+except ImportError:  # pragma: no cover
+    PdfReader = None
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Load .env locally. On Render this file won't exist, and that's fine -
@@ -262,6 +281,410 @@ async def forget_fact_tool(user_id: int, fact: str) -> str:
     return "پاک شد و دیگه بهش استناد نمی‌کنم." if changed else "همچین موردی بین چیزهای ذخیره‌شده پیدا نکردم."
 
 
+# ---------------------- PER-USER PERSONALITY (Upstash Redis) ----------------------
+# The bot used to have exactly one personality baked into BASE_SYSTEM_PROMPT
+# for everybody. Now each user picks their own (or writes a custom one), it's
+# saved next to their long-term memory in Upstash, and it survives restarts.
+# The owner's "father" rule is separate and always applies on top, whatever
+# personality is chosen.
+PERSONALITY_KEY_PREFIX = "personality:"
+DEFAULT_PERSONALITY = "cute"
+MAX_CUSTOM_PERSONALITY_CHARS = 400
+
+# Each entry: short labels for the buttons (fa/en, everything else falls back
+# to en) plus the actual instruction block injected into the system prompt.
+PERSONALITY_PRESETS = {
+    "cute": {
+        "labels": {"fa": "🌸 دخترونه و بامزه", "en": "🌸 Cute & girly"},
+        "prompt": (
+            "- Your personality has a small, natural touch of girly/cute charm - think a\n"
+            "  friendly, upbeat young woman texting a friend, not an over-the-top anime\n"
+            "  character. Keep it light and occasional, never constant.\n"
+            "- This can show up as: a warm, cheerful tone, an occasional soft emoji\n"
+            "  (like 🌸✨💕😊 - pick one at most per message, and often use none at all),\n"
+            "  or a playful/affectionate word choice here and there.\n"
+            "- Do NOT use baby talk, \"uwu\"/\"owo\"-style speech, excessive giggling,\n"
+            "  stretched-out words (\"heyyy\", \"yesss\"), or stacks of emoji/kaomoji. That\n"
+            "  reads as cringy, not cute - avoid it entirely."
+        ),
+    },
+    "friendly": {
+        "labels": {"fa": "😊 دوستانه و ساده", "en": "😊 Friendly & casual"},
+        "prompt": (
+            "- You talk like a relaxed, friendly person - casual, warm, everyday language.\n"
+            "- No corporate stiffness, no cutesy act, no heavy emoji use (one now and then\n"
+            "  at most). Just a normal friend who happens to know a lot."
+        ),
+    },
+    "pro": {
+        "labels": {"fa": "🎩 رسمی و حرفه‌ای", "en": "🎩 Formal & professional"},
+        "prompt": (
+            "- You are precise, professional, and polite, the way a good colleague writes\n"
+            "  at work. Full sentences, correct terminology, no slang.\n"
+            "- Do not use emoji. Do not use pet names or affectionate wording.\n"
+            "- Structure longer answers with short numbered points when that helps."
+        ),
+    },
+    "funny": {
+        "labels": {"fa": "😎 شوخ و بامزه", "en": "😎 Witty & funny"},
+        "prompt": (
+            "- You are quick-witted and a bit cheeky - light jokes, playful asides, the\n"
+            "  occasional bit of harmless sarcasm.\n"
+            "- The joke never replaces the answer: be funny on the way to being useful,\n"
+            "  and drop the humour entirely if the user seems upset or the topic is serious.\n"
+            "- Never mock the user, their questions, or anyone's identity."
+        ),
+    },
+    "tutor": {
+        "labels": {"fa": "📚 معلم و توضیح‌دهنده", "en": "📚 Patient tutor"},
+        "prompt": (
+            "- You explain things like a patient teacher: start from what the user already\n"
+            "  seems to know, build up step by step, and use concrete examples or analogies.\n"
+            "- Check understanding with a short question at the end when it makes sense.\n"
+            "- Never make the user feel slow for asking something basic."
+        ),
+    },
+    "calm": {
+        "labels": {"fa": "🕊️ آرام و همدل", "en": "🕊️ Calm & supportive"},
+        "prompt": (
+            "- Your tone is calm, gentle, and grounded. You listen first and don't rush\n"
+            "  the user toward a solution.\n"
+            "- You acknowledge how something feels before giving practical advice, and you\n"
+            "  keep advice small and doable.\n"
+            "- You are not a therapist and never pretend to be one; if someone is in real\n"
+            "  distress, gently suggest talking to a person they trust or a professional."
+        ),
+    },
+    "short": {
+        "labels": {"fa": "⚡ کوتاه و سرراست", "en": "⚡ Short & direct"},
+        "prompt": (
+            "- Answer in as few words as the question honestly allows. No preamble, no\n"
+            "  recap of the question, no filler, no emoji.\n"
+            "- Lead with the answer itself; add detail only if it's genuinely needed."
+        ),
+    },
+}
+
+
+def personality_label(code: str, ui_lang: str) -> str:
+    preset = PERSONALITY_PRESETS.get(code)
+    if not preset:
+        return code
+    labels = preset["labels"]
+    return labels.get(ui_lang) or labels.get("en") or code
+
+
+def _load_personality(user_id: int) -> dict:
+    """Blocking - wrap in asyncio.to_thread. Returns {} when nothing is
+    saved (which means 'use the default preset')."""
+    if not (UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN):
+        return {}
+    try:
+        result = _upstash_command("GET", f"{PERSONALITY_KEY_PREFIX}{user_id}").get("result")
+        if result:
+            data = json.loads(result)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[personality] failed to load for user {user_id}: {e}")
+    return {}
+
+
+def _save_personality(user_id: int, data: dict) -> None:
+    """Blocking - wrap in asyncio.to_thread."""
+    if not (UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN):
+        return
+    try:
+        _upstash_command(
+            "SET", f"{PERSONALITY_KEY_PREFIX}{user_id}", json.dumps(data, ensure_ascii=False)
+        )
+    except Exception as e:
+        print(f"[personality] failed to save for user {user_id}: {e}")
+
+
+async def get_personality(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
+    """Cached per session in user_data, same idea as the memory cache - the
+    personality changes rarely, so re-fetching it every message is waste."""
+    cached = context.user_data.get("_personality")
+    if cached is not None:
+        return cached
+    data = await asyncio.to_thread(_load_personality, user_id)
+    if not data:
+        data = {"preset": DEFAULT_PERSONALITY}
+    context.user_data["_personality"] = data
+    return data
+
+
+async def set_personality(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, preset: str, custom_text: str = ""
+) -> None:
+    data = {"preset": preset}
+    if custom_text:
+        data["custom"] = custom_text[:MAX_CUSTOM_PERSONALITY_CHARS]
+    context.user_data["_personality"] = data
+    await asyncio.to_thread(_save_personality, user_id, data)
+    # The system prompt (personality included) is baked in when a session's
+    # history starts, so old histories have to go or the change wouldn't show
+    # up until the user happened to start a fresh conversation.
+    for key in ("history_groq", "history_groq_search", "history_gemini", "history_groq_images"):
+        context.user_data.pop(key, None)
+
+
+def personality_block(data: dict) -> str:
+    """Turn a stored personality record into the PERSONALITY section of the
+    system prompt."""
+    preset = (data or {}).get("preset", DEFAULT_PERSONALITY)
+    if preset == "custom" and (data or {}).get("custom"):
+        return (
+            "- The user has described, in their own words, how they want you to behave:\n"
+            f"  \"{data['custom']}\"\n"
+            "- Follow that description as your personality and tone, as long as it doesn't\n"
+            "  ask you to be harmful, deceptive, or to abandon accuracy. Never invent facts\n"
+            "  or agree with something false just to stay in character."
+        )
+    return PERSONALITY_PRESETS.get(preset, PERSONALITY_PRESETS[DEFAULT_PERSONALITY])["prompt"]
+
+
+# ---------------------- REMINDERS (Upstash Redis + PTB JobQueue) ----------------------
+# Reminders are the one feature that makes the bot message the user instead of
+# only answering them. Two halves:
+#   1. Storage: every reminder is kept in one JSON list in the same Upstash DB
+#      as everything else, so a Render redeploy doesn't silently delete
+#      everybody's alarms.
+#   2. Scheduling: python-telegram-bot's JobQueue fires them. On boot,
+#      reschedule_all_reminders() re-registers every stored reminder with the
+#      new process (jobs live in RAM and die with it - the stored list is the
+#      source of truth).
+# JobQueue needs the extra: pip install "python-telegram-bot[job-queue]".
+REMINDERS_REDIS_KEY = "bot_reminders"
+REMINDERS_FILE = Path(__file__).parent / "bot_reminders.json"
+MAX_REMINDERS_PER_USER = 20
+_reminders_lock = threading.Lock()
+
+REPEAT_INTERVALS = {
+    "daily": 24 * 3600,
+    "weekly": 7 * 24 * 3600,
+    "hourly": 3600,
+}
+
+# Set in __main__ so background helpers (tool calls, job callbacks) can reach
+# the running Application without it being threaded through every function.
+BOT_APP = None
+
+
+def _load_reminders() -> list:
+    """Blocking - wrap in asyncio.to_thread."""
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+        try:
+            result = _upstash_command("GET", REMINDERS_REDIS_KEY).get("result")
+            if result:
+                data = json.loads(result)
+                return data if isinstance(data, list) else []
+        except Exception as e:
+            print(f"[reminders] failed to load from Upstash: {e}")
+        return []
+    if REMINDERS_FILE.exists():
+        try:
+            return json.loads(REMINDERS_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[reminders] failed to load {REMINDERS_FILE}: {e}")
+    return []
+
+
+def _save_reminders(items: list) -> None:
+    """Blocking - wrap in asyncio.to_thread."""
+    with _reminders_lock:
+        if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+            try:
+                _upstash_command(
+                    "SET", REMINDERS_REDIS_KEY, json.dumps(items, ensure_ascii=False)
+                )
+            except Exception as e:
+                print(f"[reminders] failed to save to Upstash: {e}")
+            return
+        try:
+            REMINDERS_FILE.write_text(
+                json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"[reminders] failed to save: {e}")
+
+
+def _store_reminder(reminder: dict) -> int:
+    """Add/replace one reminder in the stored list. Returns how many this
+    user now has. Blocking - wrap in asyncio.to_thread."""
+    items = _load_reminders()
+    items = [r for r in items if r.get("id") != reminder["id"]]
+    items.append(reminder)
+    _save_reminders(items)
+    return sum(1 for r in items if r.get("user_id") == reminder["user_id"])
+
+
+def _delete_reminder(reminder_id: str) -> bool:
+    """Blocking - wrap in asyncio.to_thread."""
+    items = _load_reminders()
+    remaining = [r for r in items if r.get("id") != reminder_id]
+    changed = len(remaining) != len(items)
+    if changed:
+        _save_reminders(remaining)
+    return changed
+
+
+def _user_reminders(user_id: int) -> list:
+    """Blocking - wrap in asyncio.to_thread."""
+    return sorted(
+        (r for r in _load_reminders() if r.get("user_id") == user_id),
+        key=lambda r: r.get("due_ts", 0),
+    )
+
+
+def format_reminder_time(reminder: dict) -> str:
+    tz_name = reminder.get("tz", "Asia/Tehran")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    when = datetime.fromtimestamp(reminder.get("due_ts", 0), tz)
+    label = when.strftime("%Y-%m-%d %H:%M")
+    repeat = reminder.get("repeat", "none")
+    if repeat in REPEAT_INTERVALS:
+        label += f" ({repeat})"
+    return label
+
+
+async def _reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fires when a reminder comes due. Sends the message, then either
+    reschedules the next occurrence (repeating) or removes it (one-off)."""
+    reminder = context.job.data
+    try:
+        await context.bot.send_message(
+            chat_id=reminder["chat_id"],
+            text=f"⏰ {reminder.get('text', '')}",
+        )
+    except Exception as e:
+        print(f"[reminders] failed to deliver {reminder.get('id')}: {e}")
+
+    repeat = reminder.get("repeat", "none")
+    interval = REPEAT_INTERVALS.get(repeat)
+    if interval:
+        now = time.time()
+        due = reminder.get("due_ts", now) + interval
+        while due <= now:  # bot was down for a while - roll forward, don't spam
+            due += interval
+        reminder["due_ts"] = due
+        await asyncio.to_thread(_store_reminder, reminder)
+        schedule_reminder_job(reminder)
+    else:
+        await asyncio.to_thread(_delete_reminder, reminder["id"])
+
+
+def schedule_reminder_job(reminder: dict) -> bool:
+    """Register one reminder with the JobQueue. Returns False if the
+    JobQueue isn't available (the [job-queue] extra isn't installed)."""
+    if BOT_APP is None or BOT_APP.job_queue is None:
+        return False
+    delay = max(1.0, reminder.get("due_ts", 0) - time.time())
+    BOT_APP.job_queue.run_once(
+        _reminder_job, when=delay, data=reminder, name=f"reminder:{reminder['id']}"
+    )
+    return True
+
+
+def cancel_reminder_job(reminder_id: str) -> None:
+    if BOT_APP is None or BOT_APP.job_queue is None:
+        return
+    for job in BOT_APP.job_queue.get_jobs_by_name(f"reminder:{reminder_id}"):
+        job.schedule_removal()
+
+
+async def add_reminder(
+    user_id: int, chat_id: int, text: str, due_ts: float, repeat: str = "none", tz: str = "Asia/Tehran"
+) -> dict | None:
+    """Save + schedule one reminder. Returns None if the user is already at
+    MAX_REMINDERS_PER_USER."""
+    existing = await asyncio.to_thread(_user_reminders, user_id)
+    if len(existing) >= MAX_REMINDERS_PER_USER:
+        return None
+    reminder = {
+        "id": uuid.uuid4().hex[:10],
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "text": (text or "").strip()[:500],
+        "due_ts": float(due_ts),
+        "repeat": repeat if repeat in REPEAT_INTERVALS else "none",
+        "tz": tz,
+    }
+    await asyncio.to_thread(_store_reminder, reminder)
+    schedule_reminder_job(reminder)
+    return reminder
+
+
+async def reschedule_all_reminders() -> int:
+    """Called once at startup: re-register every stored reminder with this
+    fresh process. Overdue one-offs (bot was down when they were due) fire a
+    few seconds after boot rather than being silently dropped."""
+    items = await asyncio.to_thread(_load_reminders)
+    now = time.time()
+    count = 0
+    for reminder in items:
+        interval = REPEAT_INTERVALS.get(reminder.get("repeat", "none"))
+        if interval:
+            due = reminder.get("due_ts", now)
+            while due <= now:
+                due += interval
+            reminder["due_ts"] = due
+        elif reminder.get("due_ts", 0) <= now:
+            reminder["due_ts"] = now + 5  # deliver it late rather than never
+        if schedule_reminder_job(reminder):
+            count += 1
+    if items:
+        await asyncio.to_thread(_save_reminders, items)
+    return count
+
+
+# Parsing helpers shared by the /remind command and the AI's set_reminder tool.
+_DURATION_RE = re.compile(
+    r"^(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|"
+    r"ثانیه|دقیقه|دقیقه‌|ساعت|روز)$",
+    re.IGNORECASE,
+)
+_CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def parse_duration_to_seconds(token: str) -> int | None:
+    """'20m' / '2h' / '30s' / '3d' / '۲ساعت'-style tokens -> seconds."""
+    match = _DURATION_RE.match((token or "").strip())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    if unit in ("s", "sec", "secs", "second", "seconds", "ثانیه"):
+        return amount
+    if unit in ("m", "min", "mins", "minute", "minutes", "دقیقه", "دقیقه‌"):
+        return amount * 60
+    if unit in ("h", "hr", "hrs", "hour", "hours", "ساعت"):
+        return amount * 3600
+    return amount * 86400
+
+
+def next_clock_time(clock: str, tz_name: str = "Asia/Tehran") -> float | None:
+    """'08:30' -> the timestamp of the next time it's 08:30 in that timezone."""
+    match = _CLOCK_RE.match((clock or "").strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Tehran")
+    now = datetime.now(tz)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target.timestamp()
+
+
 def record_user_activity(update: Update) -> None:
     """Called on every incoming update (group=-1, before any other handler)
     so the admin panel has real numbers to show. Only updates BOT_STATS in
@@ -342,18 +765,9 @@ BASE_SYSTEM_PROMPT = """
 You are a helpful, warm, and unfailingly polite AI assistant inside a Telegram bot.
 
 PERSONALITY:
-- Your personality has a small, natural touch of girly/cute charm - think a
-  friendly, upbeat young woman texting a friend, not an over-the-top anime
-  character. Keep it light and occasional, never constant.
-- This can show up as: a warm, cheerful tone, an occasional soft emoji
-  (like 🌸✨💕😊 - pick one at most per message, and often use none at all),
-  or a playful/affectionate word choice here and there.
-- Do NOT use baby talk, "uwu"/"owo"-style speech, excessive giggling,
-  stretched-out words ("heyyy", "yesss"), or stacks of emoji/kaomoji. That
-  reads as cringy, not cute - avoid it entirely.
+{personality_block}
 - Never let this override clarity or usefulness. For serious, technical, or
-  sensitive topics, drop the cute touches completely and just be direct and
-  helpful.
+  sensitive topics, drop the stylistic touches and just be direct and helpful.
 
 LANGUAGE:
 - You are fully multilingual. You understand and can fluently write in any
@@ -447,10 +861,50 @@ LONG-TERM MEMORY:
 """
 
 
-def build_system_prompt(owner: bool, memory_facts: list | None = None, tools_available: bool = True) -> str:
-    prompt = BASE_SYSTEM_PROMPT
+EXTRA_TOOL_INSTRUCTIONS = """
+IMAGES:
+- You have a search_images tool that finds real photos on the web and sends
+  them to the user as actual Telegram photos.
+- Use it whenever the user asks to SEE something - "a picture of X", "show me
+  X", "عکس X رو بفرست", "what does X look like" - and also when a picture
+  would obviously help (a species, a place, a landmark, a dish, a diagram of
+  a concept, a product).
+- Think like a good researcher, not a single-keyword search box: pick a
+  specific, descriptive English query that will actually return the right
+  images (for example, for "عکس باکتری" use something like
+  "bacteria microscope photograph", not "bacteria"), and ask for several
+  images (3-6) so the user gets a proper set, not one random photo.
+- If the subject has clearly different aspects worth showing (different
+  species, angles, stages, before/after), call search_images more than once
+  with different queries instead of repeating the same one.
+- The images are sent automatically alongside your reply. So write a real
+  answer explaining what's in them - never say "here is the image" and
+  nothing else, and never paste image URLs into your text.
+
+REMINDERS:
+- You have a set_reminder tool that makes the bot message the user later.
+- Use it whenever the user asks to be reminded, woken up, nudged, or told
+  something at a certain time ("یادم بنداز...", "remind me in 20 minutes",
+  "every morning at 8 tell me to...").
+- For a relative time use delay_minutes. For a clock time use at_time with
+  "HH:MM" in 24-hour format, and set repeat to "daily"/"weekly"/"hourly" if
+  they want it to keep happening.
+- Put ONLY the thing to be reminded of in `text`, written the way the user
+  would want to read it later, in their language.
+- After the tool succeeds, confirm naturally what you'll remind them of and
+  when. If it fails, say so honestly instead of pretending it worked.
+"""
+
+
+def build_system_prompt(
+    owner: bool,
+    memory_facts: list | None = None,
+    tools_available: bool = True,
+    personality: dict | None = None,
+) -> str:
+    prompt = BASE_SYSTEM_PROMPT.replace("{personality_block}", personality_block(personality))
     if tools_available:
-        prompt += "\n" + MEMORY_TOOL_INSTRUCTIONS
+        prompt += "\n" + MEMORY_TOOL_INSTRUCTIONS + "\n" + EXTRA_TOOL_INSTRUCTIONS
     if memory_facts:
         facts_block = "\n".join(f"- {f}" for f in memory_facts)
         prompt += (
@@ -481,26 +935,48 @@ def run_flask():
 
 
 # ---------------------- START MENU ----------------------
+def build_start_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    """Every feature the bot has, on one screen. Anything not listed here may
+    as well not exist - people don't read /help."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(ui(context, "btn_ai_groq"), callback_data="ai_groq"),
+                InlineKeyboardButton(ui(context, "btn_ai_gemini"), callback_data="ai_gemini"),
+            ],
+            [
+                InlineKeyboardButton(ui(context, "btn_web_search"), callback_data="ai_groq_search"),
+                InlineKeyboardButton(ui(context, "btn_images"), callback_data="ai_images"),
+            ],
+            [
+                InlineKeyboardButton(ui(context, "btn_translate_menu"), callback_data="ai_translate_menu"),
+                InlineKeyboardButton(ui(context, "btn_pdf"), callback_data="pdf_help"),
+            ],
+            [
+                InlineKeyboardButton(ui(context, "btn_personality"), callback_data="personality_menu"),
+                InlineKeyboardButton(ui(context, "btn_reminders"), callback_data="reminders_menu"),
+            ],
+            [
+                # switch_inline_query opens Telegram's chat picker and drops
+                # "@thisbot " into whichever chat they choose - the cheapest
+                # word-of-mouth loop there is, since their friends see the bot
+                # working inside a chat they're already in.
+                InlineKeyboardButton(ui(context, "btn_share"), switch_inline_query=""),
+            ],
+        ]
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [
-        [
-            InlineKeyboardButton(ui(context, "btn_ai_groq"), callback_data="ai_groq"),
-            InlineKeyboardButton(ui(context, "btn_ai_gemini"), callback_data="ai_gemini"),
-        ],
-        [
-            InlineKeyboardButton(ui(context, "btn_web_search"), callback_data="ai_groq_search"),
-        ],
-        [
-            InlineKeyboardButton(ui(context, "btn_translate_menu"), callback_data="ai_translate_menu"),
-        ],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(ui(context, "start_greeting"), reply_markup=reply_markup)
+    await update.message.reply_text(
+        ui(context, "start_greeting") + "\n\n" + ui(context, "start_features"),
+        reply_markup=build_start_keyboard(context),
+    )
 
 
 # ---------------------- HELP ----------------------
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = ui(context, "help_text")
+    text = ui(context, "help_text") + "\n" + ui(context, "help_extra")
     if is_owner(update):
         text += "\n\n🔐 /admin — پنل مدیریت ربات (فقط قابل مشاهده برای تو)"
     await update.message.reply_text(text)
@@ -511,6 +987,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # commands below, so the two entry points never drift out of sync.
 def activate_groq_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
     context.user_data["ai_mode"] = True
+    context.user_data["ai_off"] = False  # an explicit choice always overrides a previous /stop
     context.user_data["ai_provider"] = "groq"
     context.user_data.setdefault("history_groq", [])
     return ui(context, "mode_groq_on")
@@ -518,6 +995,7 @@ def activate_groq_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def activate_gemini_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
     context.user_data["ai_mode"] = True
+    context.user_data["ai_off"] = False  # an explicit choice always overrides a previous /stop
     context.user_data["ai_provider"] = "gemini"
     context.user_data.setdefault("history_gemini", [])
     return ui(context, "mode_gemini_on")
@@ -525,9 +1003,18 @@ def activate_gemini_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def activate_search_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
     context.user_data["ai_mode"] = True
+    context.user_data["ai_off"] = False  # an explicit choice always overrides a previous /stop
     context.user_data["ai_provider"] = "groq_search"
     context.user_data.setdefault("history_groq_search", [])
     return ui(context, "mode_search_on")
+
+
+def activate_images_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    context.user_data["ai_mode"] = True
+    context.user_data["ai_off"] = False  # an explicit choice always overrides a previous /stop
+    context.user_data["ai_provider"] = "groq_images"
+    context.user_data.setdefault("history_groq_images", [])
+    return ui(context, "mode_images_on")
 
 
 def activate_translate_mode(context: ContextTypes.DEFAULT_TYPE, target: str) -> str:
@@ -536,6 +1023,7 @@ def activate_translate_mode(context: ContextTypes.DEFAULT_TYPE, target: str) -> 
     in the LANGUAGES dict at all - the underlying AI translator understands
     language names directly, so this isn't limited to the dict's contents."""
     context.user_data["ai_mode"] = True
+    context.user_data["ai_off"] = False  # an explicit choice always overrides a previous /stop
     context.user_data["ai_provider"] = "translate"
     context.user_data["translate_target"] = target
     if target == "auto":
@@ -560,6 +1048,28 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     elif query.data == "ai_groq_search":
         await query.edit_message_text(activate_search_mode(context))
+
+    elif query.data == "ai_images":
+        await query.edit_message_text(activate_images_mode(context))
+
+    elif query.data == "pdf_help":
+        await query.edit_message_text(ui(context, "pdf_help"))
+
+    elif query.data == "personality_menu":
+        data = await get_personality(context, update.effective_user.id)
+        await query.edit_message_text(
+            ui(context, "personality_prompt"),
+            reply_markup=build_personality_keyboard(context, data.get("preset", DEFAULT_PERSONALITY)),
+        )
+
+    elif query.data.startswith("pers:"):
+        await handle_personality_button(update, context)
+
+    elif query.data == "reminders_menu":
+        await _render_reminders(update, context, edit=True)
+
+    elif query.data.startswith("remdel:"):
+        await handle_reminder_delete_button(update, context)
 
     elif query.data == "ai_translate_menu":
         await query.edit_message_text(
@@ -605,9 +1115,60 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await handle_admin_button(update, context)
 
 
+# ---------------------- "JUST TALK TO ME" GATE ----------------------
+# Originally every message was ignored unless the user had gone through
+# /start -> button first, which meant new people messaged the bot, got
+# silence, and left. Now a plain message in a private chat just works: AI
+# mode switches itself on the first time and stays on.
+#
+# Two things keep that from becoming annoying:
+#   - /stop sets "ai_off", which this respects until the user turns AI mode
+#     back on themselves (otherwise /stop would do nothing at all).
+#   - In groups the bot still only answers when it's actually being talked
+#     to - mentioned by username, or replied to. Auto-answering every message
+#     in a group is the fastest way to get a bot kicked out.
+def _strip_bot_mention(text: str, username: str | None) -> str:
+    if not username:
+        return text
+    return re.sub(rf"@{re.escape(username)}\b", "", text, flags=re.IGNORECASE).strip()
+
+
+async def ensure_ai_ready(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if this message should be handled by the AI. Switches AI
+    mode on by itself when needed, so users never have to 'activate' anything
+    to get an answer."""
+    chat = update.effective_chat
+    message = update.message
+    if message is None:
+        return False
+
+    if chat.type != "private":
+        text = message.text or message.caption or ""
+        username = context.bot.username
+        mentioned = bool(username) and f"@{username}".lower() in text.lower()
+        replied_to_bot = bool(
+            message.reply_to_message
+            and message.reply_to_message.from_user
+            and message.reply_to_message.from_user.id == context.bot.id
+        )
+        if not (mentioned or replied_to_bot):
+            return False
+
+    if context.user_data.get("ai_off"):
+        return False
+
+    if not context.user_data.get("ai_mode"):
+        activate_groq_mode(context)
+    return True
+
+
 # ---------------------- STOP AI MODE (optional command) ----------------------
 async def stop_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["ai_mode"] = False
+    # Without this flag, the "just talk to me" gate above would helpfully
+    # switch AI mode straight back on with the user's very next message, and
+    # /stop would look broken.
+    context.user_data["ai_off"] = True
     await update.message.reply_text(ui(context, "stop_ai_msg"))
 
 
@@ -622,6 +1183,165 @@ async def gemini_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def websearch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(activate_search_mode(context))
+
+
+async def images_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/images on its own switches into image mode; /images <query> does one
+    search straight away, without changing the current mode."""
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await update.message.reply_text(activate_images_mode(context))
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+    results = await search_images(query, 5)
+    sent = await send_image_batch(
+        context.bot,
+        chat_id,
+        {"query": query, "results": results, "count": 5},
+        reply_to_message_id=update.message.message_id,
+    )
+    if not sent:
+        await update.message.reply_text(ui(context, "images_none", query=query))
+
+
+# ---------------------- /personality COMMAND (per-user tone) ----------------------
+def build_personality_keyboard(context: ContextTypes.DEFAULT_TYPE, current: str) -> InlineKeyboardMarkup:
+    lang = get_ui_lang(context)
+    rows, row = [], []
+    for code in PERSONALITY_PRESETS:
+        label = personality_label(code, lang)
+        if code == current:
+            label = "✅ " + label
+        row.append(InlineKeyboardButton(label, callback_data=f"pers:{code}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    custom_label = ui(context, "btn_personality_custom")
+    if current == "custom":
+        custom_label = "✅ " + custom_label
+    rows.append([InlineKeyboardButton(custom_label, callback_data="pers:custom")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def personality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = await get_personality(context, update.effective_user.id)
+    current = data.get("preset", DEFAULT_PERSONALITY)
+    await update.message.reply_text(
+        ui(context, "personality_prompt"),
+        reply_markup=build_personality_keyboard(context, current),
+    )
+
+
+async def handle_personality_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    code = query.data.split(":", 1)[1]
+    user_id = update.effective_user.id
+
+    if code == "custom":
+        # The next plain text message this user sends becomes their custom
+        # personality - handled at the top of text_router.
+        context.user_data["awaiting_personality"] = True
+        await query.edit_message_text(ui(context, "personality_custom_prompt"))
+        return
+
+    if code not in PERSONALITY_PRESETS:
+        return
+    await set_personality(context, user_id, code)
+    await query.edit_message_text(
+        ui(context, "personality_set", name=personality_label(code, get_ui_lang(context)))
+    )
+
+
+# ---------------------- /remind + /reminders COMMANDS ----------------------
+async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(ui(context, "remind_usage"))
+        return
+
+    if BOT_APP is None or BOT_APP.job_queue is None:
+        await update.message.reply_text(ui(context, "remind_unavailable"))
+        return
+
+    when_token = args[0]
+    rest = args[1:]
+
+    repeat = "none"
+    if rest and rest[0].lower() in REPEAT_INTERVALS:
+        repeat = rest[0].lower()
+        rest = rest[1:]
+    text = " ".join(rest).strip()
+    if not text:
+        await update.message.reply_text(ui(context, "remind_usage"))
+        return
+
+    tz = context.user_data.get("tz", "Asia/Tehran")
+    seconds = parse_duration_to_seconds(when_token)
+    if seconds is not None:
+        due_ts = time.time() + seconds
+    else:
+        due_ts = next_clock_time(when_token, tz)
+    if due_ts is None:
+        await update.message.reply_text(ui(context, "remind_usage"))
+        return
+
+    reminder = await add_reminder(
+        update.effective_user.id, update.effective_chat.id, text, due_ts, repeat, tz
+    )
+    if reminder is None:
+        await update.message.reply_text(ui(context, "remind_limit", limit=MAX_REMINDERS_PER_USER))
+        return
+    await update.message.reply_text(
+        ui(context, "remind_set", when=format_reminder_time(reminder), text=reminder["text"])
+    )
+
+
+def build_reminders_keyboard(context: ContextTypes.DEFAULT_TYPE, items: list) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🗑 {format_reminder_time(r)} — {r['text'][:25]}",
+                callback_data=f"remdel:{r['id']}",
+            )
+        ]
+        for r in items[:10]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _render_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool) -> None:
+    items = await asyncio.to_thread(_user_reminders, update.effective_user.id)
+    if not items:
+        text, markup = ui(context, "reminders_empty"), None
+    else:
+        lines = [ui(context, "reminders_header")]
+        lines += [f"• {format_reminder_time(r)} — {r['text']}" for r in items[:10]]
+        text = "\n".join(lines) + "\n\n" + ui(context, "reminders_delete_hint")
+        markup = build_reminders_keyboard(context, items)
+
+    if edit:
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
+    else:
+        await update.message.reply_text(text, reply_markup=markup)
+
+
+async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _render_reminders(update, context, edit=False)
+
+
+async def handle_reminder_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reminder_id = update.callback_query.data.split(":", 1)[1]
+    items = await asyncio.to_thread(_user_reminders, update.effective_user.id)
+    # Only ever delete a reminder that belongs to whoever pressed the button.
+    if not any(r["id"] == reminder_id for r in items):
+        return
+    cancel_reminder_job(reminder_id)
+    await asyncio.to_thread(_delete_reminder, reminder_id)
+    await _render_reminders(update, context, edit=True)
 
 
 # ---------------------- /language COMMAND (change the bot's OWN interface language) ----------------------
@@ -748,6 +1468,121 @@ async def fetch_page(url: str) -> str:
     return await asyncio.to_thread(_fetch_page_sync, url)
 
 
+# ---------------------- IMAGE SEARCH (DuckDuckGo images, no API key) ----------------------
+# "Ask about a bacterium, get a set of real photos back" - the model picks a
+# proper English search query itself via the search_images tool, so this works
+# like a real assistant researching images rather than a dumb keyword lookup.
+MAX_IMAGES_PER_BATCH = 6  # Telegram allows 10 per album; 6 keeps it fast and tidy
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # skip anything huge - Telegram rejects it anyway
+
+
+def _ddg_images_sync(query: str, max_results: int = 5) -> list:
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=max_results))
+    except Exception as e:
+        print(f"[images] search failed for '{query}': {e}")
+        return []
+    cleaned = []
+    for r in results:
+        url = r.get("image") or r.get("thumbnail")
+        if not url:
+            continue
+        cleaned.append(
+            {
+                "url": url,
+                "title": (r.get("title") or "").strip()[:150],
+                "source": r.get("url") or "",
+            }
+        )
+    return cleaned
+
+
+async def search_images(query: str, count: int = 4) -> list:
+    count = max(1, min(int(count or 4), MAX_IMAGES_PER_BATCH))
+    # Ask for a few extra: some results are dead links or unfetchable, and
+    # it's better to over-fetch metadata than to end up sending two photos.
+    return await asyncio.to_thread(_ddg_images_sync, query, count + 4)
+
+
+def _download_image_sync(url: str) -> bytes | None:
+    try:
+        resp = requests.get(
+            url,
+            timeout=10,
+            stream=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"},
+        )
+        resp.raise_for_status()
+        if "image" not in resp.headers.get("Content-Type", ""):
+            return None
+        data = b""
+        for chunk in resp.iter_content(64 * 1024):
+            data += chunk
+            if len(data) > MAX_IMAGE_BYTES:
+                return None
+        return data or None
+    except Exception:
+        return None
+
+
+async def send_image_batch(
+    bot, chat_id: int, batch: dict, reply_to_message_id: int | None = None
+) -> int:
+    """Send one search_images result set as a real Telegram photo album.
+    Images are downloaded here rather than handed to Telegram as URLs,
+    because a lot of image hosts block Telegram's fetcher and you'd just get
+    an error instead of a photo. Returns how many were actually sent."""
+    query = batch.get("query", "")
+    results = batch.get("results", [])[: MAX_IMAGES_PER_BATCH + 4]
+    wanted = batch.get("count", MAX_IMAGES_PER_BATCH)
+
+    downloads = await asyncio.gather(
+        *(asyncio.to_thread(_download_image_sync, r["url"]) for r in results)
+    )
+
+    blobs, used = [], []
+    for result, data in zip(results, downloads):
+        if not data:
+            continue
+        blobs.append(data)
+        used.append(result)
+        if len(blobs) >= wanted:
+            break
+
+    if not blobs:
+        return 0
+
+    caption_lines = [f"🖼 {query}"]
+    for i, result in enumerate(used, start=1):
+        if result["title"]:
+            caption_lines.append(f"{i}. {result['title']}")
+    caption = "\n".join(caption_lines)[:1000]
+
+    media = [
+        InputMediaPhoto(media=io.BytesIO(data), caption=caption if i == 0 else None)
+        for i, data in enumerate(blobs)
+    ]
+
+    try:
+        await bot.send_media_group(
+            chat_id=chat_id, media=media, reply_to_message_id=reply_to_message_id
+        )
+        return len(media)
+    except Exception as e:
+        print(f"[images] send_media_group failed: {e}")
+        # Albums are all-or-nothing, so one bad file loses the whole set -
+        # fall back to sending them individually from the raw bytes.
+        sent = 0
+        for data in blobs:
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=io.BytesIO(data))
+                sent += 1
+            except Exception:
+                continue
+        return sent
+
+
 # ---------------------- REAL CURRENT TIME (deterministic, no guessing) ----------------------
 def get_current_datetime(timezone: str) -> str:
     try:
@@ -872,6 +1707,73 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_images",
+            "description": (
+                "Search the web for real photos and send them to the user as "
+                "actual Telegram images. Use this for any 'show me / picture of "
+                "/ what does X look like / عکس X' request, and whenever a set of "
+                "pictures would genuinely help. Write a specific, descriptive "
+                "English query (e.g. 'bacteria under microscope photograph', not "
+                "just 'bacteria'). You may call it more than once with different "
+                "queries to cover different aspects of the subject."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A specific, descriptive image search query, preferably in English for better results.",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "How many images to send for this query (1-6). Use 3-6 for a normal 'show me X' request.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder",
+            "description": (
+                "Schedule a reminder: the bot will message the user at the given "
+                "time with the given text. Use delay_minutes for relative times "
+                "('in 20 minutes'), or at_time ('HH:MM', 24-hour) for clock "
+                "times, optionally with repeat for recurring reminders."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "What to remind the user about, in their own language, phrased as they'd want to read it later.",
+                    },
+                    "delay_minutes": {
+                        "type": "number",
+                        "description": "Fire this many minutes from now. Use this for 'in X minutes/hours' requests.",
+                    },
+                    "at_time": {
+                        "type": "string",
+                        "description": "Clock time in 'HH:MM' 24-hour format; fires at the next occurrence of that time. Use instead of delay_minutes.",
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone for at_time, e.g. 'Asia/Tehran'. Defaults to Asia/Tehran if unknown.",
+                    },
+                    "repeat": {
+                        "type": "string",
+                        "description": "One of 'none', 'hourly', 'daily', 'weekly'. Use 'daily' for 'every morning/day' style requests.",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "forget_fact",
             "description": "Remove a previously remembered fact about the user that is no longer true or that the user asked you to forget.",
             "parameters": {
@@ -889,12 +1791,60 @@ TOOLS = [
 ]
 
 
-async def execute_tool(tool_call, user_id: int) -> str:
+async def execute_tool(tool_call, user_id: int, tool_ctx: dict | None = None) -> str:
+    """tool_ctx carries the things a tool needs that aren't in the model's
+    arguments: which chat this is, and a list to drop image batches into so
+    ai_handler can send them after the text reply."""
     name = tool_call.function.name
+    tool_ctx = tool_ctx if tool_ctx is not None else {}
     try:
         args = json.loads(tool_call.function.arguments or "{}")
     except json.JSONDecodeError:
         args = {}
+
+    if name == "search_images":
+        query = (args.get("query") or "").strip()
+        if not query:
+            return "(هیچ عبارتی برای جستجوی عکس داده نشد.)"
+        count = args.get("count") or 4
+        results = await search_images(query, count)
+        if not results:
+            return f"(برای «{query}» عکسی پیدا نشد.)"
+        sink = tool_ctx.get("images")
+        if sink is not None and len(sink) < 3:  # at most 3 albums per reply
+            sink.append(
+                {"query": query, "results": results, "count": max(1, min(int(count), MAX_IMAGES_PER_BATCH))}
+            )
+        titles = "; ".join(r["title"] for r in results[:6] if r["title"])
+        return (
+            f"{len(results)} عکس برای «{query}» پیدا شد و همین الان برای کاربر ارسال می‌شه. "
+            f"عنوان‌ها: {titles or 'بدون عنوان'}. "
+            "حالا درباره‌ی موضوع توضیح بده - نیازی نیست بگی «عکس رو فرستادم» یا لینک بذاری."
+        )
+
+    if name == "set_reminder":
+        text = (args.get("text") or "").strip()
+        chat_id = tool_ctx.get("chat_id")
+        if not text or chat_id is None:
+            return "(یادآوری ثبت نشد: متن یا چت مشخص نیست.)"
+        tz = args.get("timezone") or "Asia/Tehran"
+        repeat = (args.get("repeat") or "none").lower()
+        due_ts = None
+        if args.get("delay_minutes") is not None:
+            try:
+                due_ts = time.time() + max(0.2, float(args["delay_minutes"])) * 60
+            except (TypeError, ValueError):
+                due_ts = None
+        if due_ts is None and args.get("at_time"):
+            due_ts = next_clock_time(str(args["at_time"]), tz)
+        if due_ts is None:
+            return "(زمان یادآوری مشخص نیست - از کاربر بپرس دقیقاً کِی یادآوری بشه.)"
+        if BOT_APP is None or BOT_APP.job_queue is None:
+            return "(قابلیت یادآوری روی این سرور فعال نیست - صادقانه به کاربر بگو که نتونستی ثبتش کنی.)"
+        reminder = await add_reminder(user_id, chat_id, text, due_ts, repeat, tz)
+        if reminder is None:
+            return f"(کاربر به سقف {MAX_REMINDERS_PER_USER} یادآوری رسیده - باید اول با /reminders یکی رو حذف کنه.)"
+        return f"یادآوری ثبت شد برای {format_reminder_time(reminder)} با متن: {reminder['text']}"
 
     if name == "web_search":
         return await web_search(args.get("query", ""))
@@ -970,7 +1920,26 @@ FORCE_SEARCH_HINT = {
 }
 
 
-async def run_groq_agent(history: list, user_id: int, model: str = GROQ_MODEL, force_search: bool = False) -> str:
+FORCE_IMAGES_HINT = {
+    "role": "system",
+    "content": (
+        "کاربر از حالت «جستجوی عکس» استفاده می‌کنه. پیامش رو به عنوان موضوعی که "
+        "می‌خواد ببینه در نظر بگیر: حتماً ابزار search_images رو با یک عبارت "
+        "دقیق و توصیفی (ترجیحاً انگلیسی) و با count بین ۳ تا ۶ صدا بزن، و اگه "
+        "موضوع چند جنبه‌ی متفاوت داره بیشتر از یک بار با عبارت‌های مختلف. بعد "
+        "یک توضیح کوتاه و مفید درباره‌ی چیزی که تو عکس‌هاست بنویس."
+    ),
+}
+
+
+async def run_groq_agent(
+    history: list,
+    user_id: int,
+    model: str = GROQ_MODEL,
+    force_search: bool = False,
+    force_images: bool = False,
+    tool_ctx: dict | None = None,
+) -> str:
     # The user's actual question, so we can rebuild a clean prompt later.
     original_user_text = history[-1]["content"] if history and history[-1].get("role") == "user" else ""
 
@@ -983,6 +1952,8 @@ async def run_groq_agent(history: list, user_id: int, model: str = GROQ_MODEL, f
     working = _trim_messages_to_budget(list(history))
     if force_search:
         working = working + [FORCE_SEARCH_HINT]
+    if force_images:
+        working = working + [FORCE_IMAGES_HINT]
 
     gathered_info = []  # plain-text notes on what each tool call found
 
@@ -1068,7 +2039,7 @@ async def run_groq_agent(history: list, user_id: int, model: str = GROQ_MODEL, f
         )
 
         for tc in msg.tool_calls:
-            result = await execute_tool(tc, user_id)
+            result = await execute_tool(tc, user_id, tool_ctx)
             gathered_info.append(f"[{tc.function.name}] {result}")
             working.append(
                 {
@@ -1266,7 +2237,7 @@ UI_STRINGS = {
             "حالت ترجمه فعال شد🌐! هر متنی به هر زبونی بفرستی، به {target} ترجمه می‌کنم.\n"
             "برای عوض کردن زبان مقصد دوباره /start رو بزن یا از دستور /translate استفاده کن."
         ),
-        "stop_ai_msg": "حالت هوش مصنوعی خاموش شد.",
+        "stop_ai_msg": "حالت هوش مصنوعی خاموش شد. تا وقتی /start یا /groq رو نزنی به پیام‌هات جواب نمی‌دم.",
         "translate_fail": "ترجمه با خطا مواجه شد. لطفاً دوباره امتحان کن.",
         "ai_call_fail": "یه خطا توی گرفتن جواب از هوش مصنوعی پیش اومد (ممکنه موقتی باشه). لطفاً دوباره امتحان کن.",
         "global_error": "یه خطای غیرمنتظره پیش اومد. لطفاً دوباره امتحان کن.",
@@ -1288,6 +2259,82 @@ UI_STRINGS = {
             "یا فقط /translate en برای فعال‌کردن حالت ترجمهٔ مداوم به انگلیسی.\n"
             "زبان مقصد می‌تونه یه کد باشه (en، fr، ja...) یا حتی اسم هر زبونی که توی لیستم نیست، "
             "مثلاً: /translate swahili سلام."
+        ),
+        # --- new features ---
+        "start_features": (
+            "چیزهایی که ازم برمیاد:\n"
+            "🤖 چت هوش مصنوعی  •  🔎 جستجوی اینترنتی  •  🖼 جستجوی عکس\n"
+            "🌐 ترجمه  •  📄 پرسش از روی PDF  •  ⏰ یادآوری\n"
+            "🎭 شخصیت دلخواه  •  🎙️ صدا به متن و متن به صدا\n\n"
+            "همینطوری پیام بده یا صدا بفرست — لازم نیست هر بار دکمه بزنی. "
+            "دکمه‌ها فقط برای وقتیه که حالت خاصی می‌خوای:"
+        ),
+        "btn_images": "🖼 جستجوی عکس",
+        "btn_pdf": "📄 سوال از PDF",
+        "btn_personality": "🎭 شخصیت ربات",
+        "btn_reminders": "⏰ یادآوری‌ها",
+        "btn_share": "🔗 استفاده در چت‌های دیگه",
+        "btn_personality_custom": "✍️ شخصیت دلخواه خودم",
+        "mode_images_on": (
+            "حالت جستجوی عکس فعال شد🖼!\n"
+            "اسم هر چیزی رو بفرست (مثلاً «باکتری» یا «کهکشان راه شیری») تا چند تا عکس واقعی "
+            "پیدا کنم و با یه توضیح کوتاه برات بفرستم."
+        ),
+        "images_none": "برای «{query}» عکس قابل ارسالی پیدا نکردم. یه عبارت دیگه امتحان کن.",
+        "personality_prompt": (
+            "می‌خوای چطوری باهات حرف بزنم؟ یکی رو انتخاب کن — هر وقت خواستی با /personality عوضش کن."
+        ),
+        "personality_set": "شخصیت من روی «{name}» تنظیم شد✅. از همین الان اعمال میشه.",
+        "personality_custom_prompt": (
+            "توی یه پیام بنویس دوست داری چطور باشم — لحن، اسمی که صدات کنم، رسمی یا خودمونی، "
+            "هر چیزی.\n\nمثال: «خودمونی حرف بزن، صدام کن رفیق، جواب‌ها کوتاه و بدون تعارف باشه.»"
+        ),
+        "personality_custom_set": "گرفتم✅ از این به بعد همونطوری که گفتی باهات حرف می‌زنم.",
+        "remind_usage": (
+            "استفاده: /remind <زمان> [تکرار] <متن>\n\n"
+            "مثال‌ها:\n"
+            "/remind 20m قرص بخور\n"
+            "/remind 2h به مامان زنگ بزن\n"
+            "/remind 08:00 daily صبحونه بخور\n\n"
+            "زمان می‌تونه فاصله باشه (30s, 20m, 2h, 3d) یا ساعت (08:00).\n"
+            "تکرار اختیاریه: hourly، daily یا weekly.\n"
+            "راستش رو بخوای لازم هم نیست این دستور رو یاد بگیری — توی حالت هوش مصنوعی "
+            "فقط بگو «یه ربع دیگه یادم بنداز آب بخورم» و خودم ثبتش می‌کنم."
+        ),
+        "remind_set": "باشه⏰ ساعت {when} یادت می‌ندازم: {text}",
+        "remind_limit": "به سقف {limit} یادآوری رسیدی. اول با /reminders یکی رو حذف کن.",
+        "remind_unavailable": (
+            "قابلیت یادآوری روی این سرور فعال نیست. برای فعال شدنش باید این نصب بشه:\n"
+            "pip install \"python-telegram-bot[job-queue]\""
+        ),
+        "reminders_header": "⏰ یادآوری‌های فعال تو:",
+        "reminders_empty": "الان هیچ یادآوری فعالی نداری. با /remind یکی بساز یا همینطوری بهم بگو «فردا ساعت ۸ یادم بنداز...».",
+        "reminders_delete_hint": "برای حذف، روی هرکدوم بزن:",
+        "pdf_help": (
+            "📄 یه فایل PDF برام بفرست، بعدش هر سوالی ازش داشتی بپرس — خلاصه‌ش کن، "
+            "یه نکته‌ی خاص رو پیدا کن، یا ازش سوال امتحانی دربیار.\n\n"
+            "برای پاک کردن فایل از حافظه: /forgetpdf"
+        ),
+        "pdf_only": "فعلاً فقط فایل PDF رو می‌تونم بخونم. لطفاً فایل رو به صورت PDF بفرست.",
+        "pdf_missing_lib": "خوندن PDF روی این سرور نصب نیست (pip install pypdf).",
+        "pdf_too_big": "این فایل خیلی بزرگه (سقف ۲۰ مگابایته). یه نسخه‌ی کوچیک‌تر یا چند تیکه بفرست.",
+        "pdf_reading": "📄 دارم فایل رو می‌خونم...",
+        "pdf_fail": "نتونستم این فایل رو باز کنم. مطمئنی سالم و قفل‌نشده‌ست؟",
+        "pdf_no_text": (
+            "این PDF متن قابل خوندن نداره — احتمالاً اسکن یا عکسه. "
+            "یه نسخه‌ی متنی‌ش رو بفرست تا بتونم بخونمش."
+        ),
+        "pdf_ready": "✅ «{name}» رو خوندم ({pages} صفحه). حالا هر سوالی ازش داری بپرس.",
+        "pdf_cleared": "فایل از حافظه پاک شد.",
+        "pdf_none": "فایلی توی حافظه نبود.",
+        "inline_result_title": "📩 ارسال جواب هوش مصنوعی",
+        "help_extra": (
+            "\nقابلیت‌های جدید:\n"
+            "🖼 /images [موضوع] - جستجوی عکس (یا فقط بگو «عکس فلان چیز رو بفرست»)\n"
+            "📄 فرستادن فایل PDF - بعدش هر سوالی ازش بپرس (/forgetpdf برای پاک کردن)\n"
+            "⏰ /remind 20m متن - یادآوری (لیست: /reminders)\n"
+            "🎭 /personality - انتخاب لحن و شخصیت ربات برای خودت\n"
+            f"🔗 توی هر چتی بنویس {BOT_USERNAME} و سوالت - بدون اینکه ربات عضو اون چت باشه"
         ),
     },
     "en": {
@@ -1322,7 +2369,7 @@ UI_STRINGS = {
             "Translate mode activated🌐! Send text in any language and I'll translate it into {target}.\n"
             "To change the target language, tap /start again or use the /translate command."
         ),
-        "stop_ai_msg": "AI mode turned off.",
+        "stop_ai_msg": "AI mode turned off. I won't reply to your messages until you tap /start or /groq.",
         "translate_fail": "Translation failed. Please try again.",
         "ai_call_fail": "There was an error getting a response from the AI (it might be temporary). Please try again.",
         "global_error": "An unexpected error occurred. Please try again.",
@@ -1345,8 +2392,98 @@ UI_STRINGS = {
             "The target can be a code (en, fr, ja...) or even any language name not in my list, "
             "e.g. /translate swahili hello."
         ),
+        # --- new features ---
+        "start_features": (
+            "Here's what I can do:\n"
+            "🤖 AI chat  •  🔎 Web search  •  🖼 Image search\n"
+            "🌐 Translation  •  📄 Ask about a PDF  •  ⏰ Reminders\n"
+            "🎭 Custom personality  •  🎙️ Voice in and voice out\n\n"
+            "Just message me (or send a voice note) — no command needed. "
+            "The buttons are only for when you want a specific mode:"
+        ),
+        "btn_images": "🖼 Image search",
+        "btn_pdf": "📄 Ask about a PDF",
+        "btn_personality": "🎭 My personality",
+        "btn_reminders": "⏰ Reminders",
+        "btn_share": "🔗 Use me in any chat",
+        "btn_personality_custom": "✍️ Write my own",
+        "mode_images_on": (
+            "Image search mode is on🖼!\n"
+            "Send me anything (\"bacteria\", \"the Milky Way\") and I'll find real photos "
+            "of it and send them with a short explanation."
+        ),
+        "images_none": "I couldn't get any usable images for \"{query}\". Try different wording.",
+        "personality_prompt": "How do you want me to talk to you? Pick one — you can change it any time with /personality.",
+        "personality_set": "Personality set to \"{name}\"✅. It applies from now on.",
+        "personality_custom_prompt": (
+            "Describe how you want me to be, in one message — tone, what to call you, "
+            "formal or casual, anything.\n\nExample: \"Be casual, call me chief, keep answers "
+            "short and skip the pleasantries.\""
+        ),
+        "personality_custom_set": "Got it✅ I'll talk to you exactly like that from now on.",
+        "remind_usage": (
+            "Usage: /remind <when> [repeat] <text>\n\n"
+            "Examples:\n"
+            "/remind 20m take the pills\n"
+            "/remind 2h call mum\n"
+            "/remind 08:00 daily have breakfast\n\n"
+            "When can be a delay (30s, 20m, 2h, 3d) or a clock time (08:00).\n"
+            "Repeat is optional: hourly, daily or weekly.\n"
+            "You don't really need this command though — in AI mode just say "
+            "\"remind me in 15 minutes to drink water\" and I'll set it up."
+        ),
+        "remind_set": "Done⏰ I'll remind you at {when}: {text}",
+        "remind_limit": "You've hit the limit of {limit} reminders. Delete one with /reminders first.",
+        "remind_unavailable": (
+            "Reminders aren't enabled on this server. To turn them on, install:\n"
+            "pip install \"python-telegram-bot[job-queue]\""
+        ),
+        "reminders_header": "⏰ Your active reminders:",
+        "reminders_empty": "No active reminders. Set one with /remind, or just tell me \"remind me tomorrow at 8 to...\".",
+        "reminders_delete_hint": "Tap one to delete it:",
+        "pdf_help": (
+            "📄 Send me a PDF, then ask anything about it — summarise it, find a specific "
+            "detail, or turn it into practice questions.\n\n"
+            "To clear the file from memory: /forgetpdf"
+        ),
+        "pdf_only": "I can only read PDF files for now. Please send it as a PDF.",
+        "pdf_missing_lib": "PDF reading isn't installed on this server (pip install pypdf).",
+        "pdf_too_big": "That file is too big (20 MB max). Try a smaller version or split it up.",
+        "pdf_reading": "📄 Reading the file...",
+        "pdf_fail": "I couldn't open that file. Is it intact and not password-protected?",
+        "pdf_no_text": (
+            "This PDF has no readable text layer — it's probably a scan or images. "
+            "Send a text-based version and I'll read it."
+        ),
+        "pdf_ready": "✅ I've read \"{name}\" ({pages} pages). Ask me anything about it.",
+        "pdf_cleared": "File cleared from memory.",
+        "pdf_none": "There was no file in memory.",
+        "inline_result_title": "📩 Send the AI's answer",
+        "help_extra": (
+            "\nNew features:\n"
+            "🖼 /images [topic] - image search (or just say \"show me a picture of X\")\n"
+            "📄 Send a PDF - then ask anything about it (/forgetpdf to clear it)\n"
+            "⏰ /remind 20m text - set a reminder (list them with /reminders)\n"
+            "🎭 /personality - pick how the bot talks to you\n"
+            f"🔗 Type {BOT_USERNAME} plus your question in ANY chat - it doesn't need to be a member"
+        ),
     },
     "ar": {
+        # --- new features (rest of the new strings fall back to English) ---
+        "start_features": (
+            "ما أستطيع فعله:\n"
+            "🤖 دردشة ذكاء اصطناعي  •  🔎 بحث في الإنترنت  •  🖼 بحث عن الصور\n"
+            "🌐 ترجمة  •  📄 أسئلة عن ملف PDF  •  ⏰ تذكيرات\n"
+            "🎭 شخصية مخصصة  •  🎙️ صوت إلى نص ونص إلى صوت\n\n"
+            "اختر من الأزرار:"
+        ),
+        "btn_images": "🖼 بحث عن الصور",
+        "btn_pdf": "📄 أسئلة عن PDF",
+        "btn_personality": "🎭 شخصية البوت",
+        "btn_reminders": "⏰ التذكيرات",
+        "btn_share": "🔗 استخدمني في أي دردشة",
+        "btn_personality_custom": "✍️ شخصية من كتابتي",
+        "personality_prompt": "كيف تريدني أن أتحدث معك؟ اختر واحدة — يمكنك تغييرها في أي وقت بـ /personality.",
         "start_greeting": "مرحبًا بك! أنا بوتك الشخصي، استخدمني بأي طريقة تحب.",
         "btn_ai_groq": "🤖 AI Groq",
         "btn_ai_gemini": "🤖 AI Gemini",
@@ -1403,6 +2540,21 @@ UI_STRINGS = {
         ),
     },
     "tr": {
+        # --- new features (rest of the new strings fall back to English) ---
+        "start_features": (
+            "Yapabildiklerim:\n"
+            "🤖 Yapay zekâ sohbeti  •  🔎 Web araması  •  🖼 Görsel arama\n"
+            "🌐 Çeviri  •  📄 PDF hakkında soru  •  ⏰ Hatırlatıcılar\n"
+            "🎭 Kişiselleştirilmiş karakter  •  🎙️ Sesten yazıya ve yazıdan sese\n\n"
+            "Aşağıdan birini seç:"
+        ),
+        "btn_images": "🖼 Görsel arama",
+        "btn_pdf": "📄 PDF'e soru sor",
+        "btn_personality": "🎭 Karakterim",
+        "btn_reminders": "⏰ Hatırlatıcılar",
+        "btn_share": "🔗 Beni her sohbette kullan",
+        "btn_personality_custom": "✍️ Kendim yazayım",
+        "personality_prompt": "Seninle nasıl konuşmamı istersin? Birini seç — istediğin zaman /personality ile değiştirebilirsin.",
         "start_greeting": "Hoş geldin! Ben senin kişisel botunum, beni istediğin gibi kullanabilirsin.",
         "btn_ai_groq": "🤖 AI Groq",
         "btn_ai_gemini": "🤖 AI Gemini",
@@ -1459,6 +2611,21 @@ UI_STRINGS = {
         ),
     },
     "ru": {
+        # --- new features (rest of the new strings fall back to English) ---
+        "start_features": (
+            "Вот что я умею:\n"
+            "🤖 ИИ-чат  •  🔎 Поиск в интернете  •  🖼 Поиск картинок\n"
+            "🌐 Перевод  •  📄 Вопросы по PDF  •  ⏰ Напоминания\n"
+            "🎭 Своя личность бота  •  🎙️ Голос в текст и текст в голос\n\n"
+            "Выбери кнопку ниже:"
+        ),
+        "btn_images": "🖼 Поиск картинок",
+        "btn_pdf": "📄 Вопросы по PDF",
+        "btn_personality": "🎭 Личность бота",
+        "btn_reminders": "⏰ Напоминания",
+        "btn_share": "🔗 Использовать в любом чате",
+        "btn_personality_custom": "✍️ Напишу свою",
+        "personality_prompt": "Как мне с тобой общаться? Выбери вариант — поменять можно в любой момент через /personality.",
         "start_greeting": "Добро пожаловать! Я твой личный бот, используй меня как захочешь.",
         "btn_ai_groq": "🤖 AI Groq",
         "btn_ai_gemini": "🤖 AI Gemini",
@@ -1515,6 +2682,21 @@ UI_STRINGS = {
         ),
     },
     "fr": {
+        # --- new features (rest of the new strings fall back to English) ---
+        "start_features": (
+            "Ce que je sais faire :\n"
+            "🤖 Chat IA  •  🔎 Recherche web  •  🖼 Recherche d'images\n"
+            "🌐 Traduction  •  📄 Questions sur un PDF  •  ⏰ Rappels\n"
+            "🎭 Personnalité au choix  •  🎙️ Voix vers texte et texte vers voix\n\n"
+            "Choisis un bouton :"
+        ),
+        "btn_images": "🖼 Recherche d'images",
+        "btn_pdf": "📄 Questions sur un PDF",
+        "btn_personality": "🎭 Ma personnalité",
+        "btn_reminders": "⏰ Rappels",
+        "btn_share": "🔗 M'utiliser dans n'importe quel chat",
+        "btn_personality_custom": "✍️ La écrire moi-même",
+        "personality_prompt": "Comment veux-tu que je te parle ? Choisis — tu peux changer à tout moment avec /personality.",
         "start_greeting": "Bienvenue ! Je suis ton bot personnel, utilise-moi comme tu veux.",
         "btn_ai_groq": "🤖 IA Groq",
         "btn_ai_gemini": "🤖 IA Gemini",
@@ -1571,6 +2753,21 @@ UI_STRINGS = {
         ),
     },
     "de": {
+        # --- new features (rest of the new strings fall back to English) ---
+        "start_features": (
+            "Das kann ich:\n"
+            "🤖 KI-Chat  •  🔎 Websuche  •  🖼 Bildersuche\n"
+            "🌐 Übersetzung  •  📄 Fragen zu einer PDF  •  ⏰ Erinnerungen\n"
+            "🎭 Eigene Persönlichkeit  •  🎙️ Sprache zu Text und Text zu Sprache\n\n"
+            "Wähl unten etwas aus:"
+        ),
+        "btn_images": "🖼 Bildersuche",
+        "btn_pdf": "📄 Fragen zur PDF",
+        "btn_personality": "🎭 Meine Persönlichkeit",
+        "btn_reminders": "⏰ Erinnerungen",
+        "btn_share": "🔗 In jedem Chat nutzen",
+        "btn_personality_custom": "✍️ Selbst schreiben",
+        "personality_prompt": "Wie soll ich mit dir reden? Such dir etwas aus — änderbar jederzeit mit /personality.",
         "start_greeting": "Willkommen! Ich bin dein persönlicher Bot, nutze mich wie du magst.",
         "btn_ai_groq": "🤖 KI Groq",
         "btn_ai_gemini": "🤖 KI Gemini",
@@ -1627,6 +2824,21 @@ UI_STRINGS = {
         ),
     },
     "es": {
+        # --- new features (rest of the new strings fall back to English) ---
+        "start_features": (
+            "Esto es lo que puedo hacer:\n"
+            "🤖 Chat con IA  •  🔎 Búsqueda web  •  🖼 Búsqueda de imágenes\n"
+            "🌐 Traducción  •  📄 Preguntas sobre un PDF  •  ⏰ Recordatorios\n"
+            "🎭 Personalidad a tu gusto  •  🎙️ Voz a texto y texto a voz\n\n"
+            "Elige un botón:"
+        ),
+        "btn_images": "🖼 Búsqueda de imágenes",
+        "btn_pdf": "📄 Preguntas sobre un PDF",
+        "btn_personality": "🎭 Mi personalidad",
+        "btn_reminders": "⏰ Recordatorios",
+        "btn_share": "🔗 Úsame en cualquier chat",
+        "btn_personality_custom": "✍️ Escribirla yo mismo",
+        "personality_prompt": "¿Cómo quieres que hable contigo? Elige una — puedes cambiarla cuando quieras con /personality.",
         "start_greeting": "¡Bienvenido! Soy tu bot personal, úsame como quieras.",
         "btn_ai_groq": "🤖 IA Groq",
         "btn_ai_gemini": "🤖 IA Gemini",
@@ -1694,7 +2906,11 @@ def ui(context: ContextTypes.DEFAULT_TYPE, key: str, **kwargs) -> str:
     (falls back to Persian for any language/key that isn't translated)."""
     lang = get_ui_lang(context)
     table = UI_STRINGS.get(lang, UI_STRINGS["fa"])
-    template = table.get(key, UI_STRINGS["fa"].get(key, key))
+    # Newer strings are only hand-written in Persian and English, so anything
+    # missing falls back to English first (readable for most users) and only
+    # then to Persian, rather than dropping an Arabic/Turkish/French user
+    # straight into Persian.
+    template = table.get(key) or UI_STRINGS["en"].get(key) or UI_STRINGS["fa"].get(key, key)
     return template.format(**kwargs) if kwargs else template
 
 
@@ -2038,8 +3254,9 @@ async def transcribe_voice(file_bytes: bytes) -> str:
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Same gate as text messages: only act on voice notes while AI mode is on
-    if not context.user_data.get("ai_mode"):
+    # Same gate as text messages: a voice note in a private chat is answered
+    # straight away, without the user activating anything first.
+    if not await ensure_ai_ready(update, context):
         return
 
     chat_id = update.effective_chat.id
@@ -2117,6 +3334,155 @@ async def translate_text(text: str, target_code: str = "auto") -> str:
     return (response.choices[0].message.content or "").strip()
 
 
+# ---------------------- PDF / DOCUMENT Q&A ----------------------
+# Upload a PDF, then ask questions about it. The whole document never goes to
+# the model - Groq's free tier has a small per-request budget (see
+# GROQ_TOKEN_BUDGET) and a 40-page PDF would blow straight through it. Instead
+# the text is split into chunks once, and each question pulls in only the few
+# chunks that actually look relevant. That's a tiny retrieval system, and it's
+# what lets a long document work at all on a free-tier model.
+MAX_PDF_BYTES = 20 * 1024 * 1024  # Telegram's own bot-API download limit
+MAX_PDF_CHARS = 120_000
+PDF_CHUNK_CHARS = 1200
+PDF_CONTEXT_CHARS = 2600  # how much document text rides along with one question
+
+
+def _extract_pdf_text_sync(data: bytes) -> tuple[str, int]:
+    reader = PdfReader(io.BytesIO(data))
+    parts, total = [], 0
+    for page in reader.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        if text:
+            parts.append(text)
+            total += len(text)
+        if total > MAX_PDF_CHARS:
+            break
+    return "\n".join(parts), len(reader.pages)
+
+
+def _chunk_text(text: str, size: int = PDF_CHUNK_CHARS) -> list:
+    words, chunks, current = text.split(), [], ""
+    for word in words:
+        if len(current) + len(word) + 1 > size:
+            chunks.append(current.strip())
+            current = ""
+        current += word + " "
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
+
+
+def _relevant_chunks(chunks: list, question: str, max_chars: int = PDF_CONTEXT_CHARS) -> str:
+    """Score chunks by how many of the question's words they contain. Crude,
+    but it's dependency-free and works well enough on a single document -
+    and it beats sending page 1 every time, which is what naive versions do."""
+    terms = [w for w in re.split(r"\W+", question.lower()) if len(w) > 2]
+    if not terms:
+        scored = list(enumerate(chunks))[:2]
+    else:
+        ranked = sorted(
+            enumerate(chunks),
+            key=lambda pair: sum(pair[1].lower().count(term) for term in terms),
+            reverse=True,
+        )
+        scored = [pair for pair in ranked if any(term in pair[1].lower() for term in terms)][:3]
+        if not scored:  # nothing matched - fall back to the start of the document
+            scored = list(enumerate(chunks))[:2]
+
+    # Put them back in document order so the excerpt reads naturally.
+    scored.sort(key=lambda pair: pair[0])
+    out, used = [], 0
+    for _, chunk in scored:
+        if used + len(chunk) > max_chars:
+            chunk = chunk[: max(0, max_chars - used)]
+        if not chunk:
+            break
+        out.append(chunk)
+        used += len(chunk)
+    return "\n...\n".join(out)
+
+
+def build_pdf_context_message(doc: dict, question: str) -> dict:
+    excerpt = _relevant_chunks(doc["chunks"], question)
+    return {
+        "role": "system",
+        "content": (
+            f"کاربر فایلی به اسم «{doc['name']}» ({doc['pages']} صفحه) آپلود کرده و "
+            "سوالش درباره‌ی همین فایله. بخش‌های مرتبط از متن فایل:\n\n"
+            f"{excerpt}\n\n"
+            "فقط بر اساس همین متن جواب بده. اگه جواب توی این بخش‌ها نبود، صادقانه "
+            "بگو که این قسمت رو توی فایل پیدا نکردی و از کاربر بخواه دقیق‌تر بپرسه - "
+            "چیزی از خودت نساز."
+        ),
+    }
+
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    doc = update.message.document
+    if doc is None:
+        return
+
+    # In a group, only take a file that's actually aimed at the bot - it
+    # shouldn't grab every PDF people share with each other. In a private
+    # chat, uploading a file is itself the request, so it always counts.
+    if update.effective_chat.type != "private" and not await ensure_ai_ready(update, context):
+        return
+
+    name = doc.file_name or "document.pdf"
+    is_pdf = (doc.mime_type == "application/pdf") or name.lower().endswith(".pdf")
+    if not is_pdf:
+        await update.message.reply_text(ui(context, "pdf_only"))
+        return
+    if PdfReader is None:
+        await update.message.reply_text(ui(context, "pdf_missing_lib"))
+        return
+    if doc.file_size and doc.file_size > MAX_PDF_BYTES:
+        await update.message.reply_text(ui(context, "pdf_too_big"))
+        return
+
+    status = await update.message.reply_text(ui(context, "pdf_reading"))
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+        text, pages = await asyncio.to_thread(_extract_pdf_text_sync, data)
+    except Exception as e:
+        print(f"[pdf] failed to read {name}: {e}")
+        await status.edit_text(ui(context, "pdf_fail"))
+        return
+
+    if not text.strip():
+        # Almost always a scanned PDF: images of text, no text layer to pull.
+        await status.edit_text(ui(context, "pdf_no_text"))
+        return
+
+    context.user_data["pdf_doc"] = {
+        "name": name,
+        "pages": pages,
+        "chunks": _chunk_text(text),
+    }
+    # A PDF is useless if the user then has to remember to turn AI mode on, so
+    # uploading one puts them straight into a mode that can answer about it.
+    if context.user_data.get("ai_provider") not in ("groq", "groq_search"):
+        activate_groq_mode(context)
+    else:
+        context.user_data["ai_mode"] = True
+    context.user_data["ai_off"] = False  # an explicit choice always overrides a previous /stop
+
+    await status.edit_text(ui(context, "pdf_ready", name=name, pages=pages))
+
+
+async def forget_pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    had = context.user_data.pop("pdf_doc", None)
+    await update.message.reply_text(
+        ui(context, "pdf_cleared") if had else ui(context, "pdf_none")
+    )
+
+
 # ---------------------- SHARED AI HANDLER ----------------------
 async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> None:
     # If this user hasn't activated AI mode, ignore their message here
@@ -2162,9 +3528,15 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
     # this user. Long-term facts are only fetched here - once, when a fresh
     # session starts - not on every message; they're baked into the system
     # message and ride along with `history` for the rest of the session.
-    if not history and provider in ("groq", "groq_search"):
+    if not history and provider in ("groq", "groq_search", "groq_images"):
         memory_facts = await _get_memory_facts_cached(context, user_id)
-        history.append({"role": "system", "content": build_system_prompt(owner, memory_facts)})
+        personality = await get_personality(context, user_id)
+        history.append(
+            {
+                "role": "system",
+                "content": build_system_prompt(owner, memory_facts, personality=personality),
+            }
+        )
 
     # Add the user's new message to this provider's own memory
     history.append({"role": "user", "content": user_text})
@@ -2215,23 +3587,58 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
         else:
             messages_for_api = history
         memory_facts = await _get_memory_facts_cached(context, user_id)
+        personality = await get_personality(context, user_id)
+        pdf_doc = context.user_data.get("pdf_doc")
+        if pdf_doc:
+            # Gemini has no system-role messages in its history, so the
+            # document excerpt rides along on this turn's user message.
+            ctx_msg = build_pdf_context_message(pdf_doc, user_text)
+            messages_for_api = messages_for_api[:-1] + [
+                {"role": "user", "content": f"{ctx_msg['content']}\n\n---\n\n{user_text}"}
+            ]
         try:
             reply_text = await call_gemini(
                 messages_for_api,
-                build_system_prompt(owner, memory_facts, tools_available=False),
+                build_system_prompt(owner, memory_facts, tools_available=False, personality=personality),
             )
         except Exception as e:
             await _handle_ai_failure(update, context, history, provider, e)
             return
         assistant_role = "model"
+        image_batches = []
     else:
         # Groq mode has a real tool-use agent: it can decide on its own to
-        # search the web, open a specific page, or check the actual current
-        # time/date - no keyword-matching needed. The dedicated search button
-        # (provider == "groq_search") just forces the first search to happen.
+        # search the web, open a specific page, check the actual current
+        # time/date, look up images, or set a reminder - no keyword-matching
+        # needed. The dedicated buttons (provider == "groq_search" /
+        # "groq_images") just nudge the first tool call in one direction.
         force_search = provider == "groq_search"
+        force_images = provider == "groq_images"
+
+        # Tools can't reach into the chat by themselves, so hand them what
+        # they need: which chat to schedule reminders for, and a list to drop
+        # image results into, which gets sent right after the text reply.
+        image_batches = []
+        tool_ctx = {"chat_id": chat_id, "images": image_batches}
+
+        history_for_call = history
+        pdf_doc = context.user_data.get("pdf_doc")
+        if pdf_doc:
+            # Slip the relevant document excerpt in just before the question,
+            # for this one call only - the stored history stays clean, so a
+            # long PDF chat doesn't accumulate excerpt after excerpt.
+            history_for_call = (
+                history[:-1] + [build_pdf_context_message(pdf_doc, user_text), history[-1]]
+            )
+
         try:
-            reply_text = await run_groq_agent(history, user_id, force_search=force_search)
+            reply_text = await run_groq_agent(
+                history_for_call,
+                user_id,
+                force_search=force_search,
+                force_images=force_images,
+                tool_ctx=tool_ctx,
+            )
         except Exception as e:
             await _handle_ai_failure(update, context, history, provider, e)
             return
@@ -2240,7 +3647,18 @@ async def ai_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_te
     # Save the model's reply into memory too
     history.append({"role": assistant_role, "content": reply_text})
 
-    await send_ai_reply(update, context, reply_text)
+    if reply_text.strip():
+        await send_ai_reply(update, context, reply_text)
+
+    # Any images the model asked for go out after the text, as real photo
+    # albums replying to the user's original message.
+    for batch in image_batches:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+        sent = await send_image_batch(
+            context.bot, chat_id, batch, reply_to_message_id=update.message.message_id
+        )
+        if not sent:
+            await update.message.reply_text(ui(context, "images_none", query=batch["query"]))
 
 
 async def _handle_ai_failure(
@@ -2453,12 +3871,108 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if context.user_data.get("ai_mode"):
-        await ai_handler(update, context, update.message.text)
+    # The user tapped "write my own personality" and this message is that
+    # description, not a question for the AI. Checked before ai_mode for the
+    # same reason as the broadcast flow above.
+    if context.user_data.get("awaiting_personality"):
+        context.user_data["awaiting_personality"] = False
+        description = (update.message.text or "").strip()
+        if description:
+            await set_personality(context, update.effective_user.id, "custom", description)
+            await update.message.reply_text(ui(context, "personality_custom_set"))
+        else:
+            await update.message.reply_text(ui(context, "personality_custom_prompt"))
         return
 
-    # Not in AI mode: ignore other text messages.
-    # Add other non-AI logic here if needed.
+    # No command, no button, no "mode" needed: if this message is meant for
+    # the bot, the gate switches AI mode on and we just answer it.
+    if not await ensure_ai_ready(update, context):
+        return
+
+    text = _strip_bot_mention(update.message.text or "", context.bot.username)
+    if not text:
+        return
+    await ai_handler(update, context, text)
+
+
+# ---------------------- INLINE MODE (@thebot <question> in ANY chat) ----------------------
+# This is the growth feature: someone types "@MyBigPotatobot what's the
+# capital of Chile" inside a group the bot isn't even a member of, and the
+# answer gets posted with the bot's name on it. Everyone in that chat sees it.
+#
+# NOTE: inline mode must also be switched on in BotFather (/setinline), or
+# Telegram never sends these updates at all.
+INLINE_MIN_QUERY_CHARS = 3
+INLINE_CACHE_TTL = 120
+_inline_cache: dict = {}  # query -> (timestamp, answer)
+_inline_inflight: set = set()
+
+INLINE_SYSTEM_PROMPT = (
+    "You are answering a question that will be posted publicly into a Telegram "
+    "chat, so keep it self-contained and under about 60 words. Plain text only: "
+    "no Markdown, no HTML, no links unless the question is about one. Always "
+    "answer in the same language the question was asked in."
+)
+
+
+async def _inline_answer(query: str) -> str:
+    cached = _inline_cache.get(query)
+    if cached and time.time() - cached[0] < INLINE_CACHE_TTL:
+        return cached[1]
+
+    response = await asyncio.to_thread(
+        groq_client.chat.completions.create,
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": INLINE_SYSTEM_PROMPT},
+            {"role": "user", "content": query},
+        ],
+        max_tokens=400,
+    )
+    answer = (response.choices[0].message.content or "").strip()
+    if answer:
+        _inline_cache[query] = (time.time(), answer)
+        if len(_inline_cache) > 300:  # bounded - this is just a typing-burst cache
+            for key in list(_inline_cache)[:100]:
+                _inline_cache.pop(key, None)
+    return answer
+
+
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    inline_query = update.inline_query
+    query = (inline_query.query or "").strip()
+
+    if len(query) < INLINE_MIN_QUERY_CHARS:
+        await inline_query.answer([], cache_time=5, is_personal=True)
+        return
+
+    # Telegram fires one update per keystroke. Without this guard a user
+    # typing a sentence would kick off a dozen model calls and burn the free
+    # tier's rate limit before they even finish the question.
+    if query in _inline_inflight:
+        return
+    _inline_inflight.add(query)
+    try:
+        answer = await _inline_answer(query)
+    except Exception as e:
+        print(f"[inline] failed for '{query}': {e}")
+        answer = ""
+    finally:
+        _inline_inflight.discard(query)
+
+    if not answer:
+        return
+
+    message_text = f"❓ {query}\n\n{answer}\n\n— via {BOT_USERNAME}"
+    results = [
+        InlineQueryResultArticle(
+            id=uuid.uuid4().hex,
+            title=ui(context, "inline_result_title"),
+            description=answer[:120],
+            input_message_content=InputTextMessageContent(message_text, parse_mode=None),
+        )
+    ]
+    await inline_query.answer(results, cache_time=30, is_personal=True)
 
 
 # ---------------------- GLOBAL ERROR HANDLER ----------------------
@@ -2472,6 +3986,41 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             await update.effective_message.reply_text(ui(context, "global_error"))
         except Exception:
             pass  # if we can't even send the error message, just give up quietly
+
+
+# ---------------------- STARTUP HOOK ----------------------
+async def on_startup(application) -> None:
+    # Scheduled jobs only live in RAM, so every restart has to re-register the
+    # reminders that are still stored in Upstash - otherwise a redeploy would
+    # silently kill everybody's reminders while still showing them in
+    # /reminders, which is worse than not having the feature at all.
+    try:
+        restored = await reschedule_all_reminders()
+        if restored:
+            print(f"[reminders] rescheduled {restored} reminder(s) after startup")
+    except Exception as e:
+        print(f"[reminders] failed to reschedule at startup: {e}")
+
+    # The "/" menu in Telegram's compose box - free discoverability for the
+    # new commands, without the user ever opening /help.
+    try:
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start", "منوی اصلی / Main menu"),
+                BotCommand("groq", "چت هوش مصنوعی / AI chat"),
+                BotCommand("websearch", "جستجوی اینترنتی / Web search"),
+                BotCommand("images", "جستجوی عکس / Image search"),
+                BotCommand("translate", "ترجمه / Translate"),
+                BotCommand("remind", "یادآوری / Set a reminder"),
+                BotCommand("reminders", "لیست یادآوری‌ها / My reminders"),
+                BotCommand("personality", "شخصیت ربات / Bot personality"),
+                BotCommand("language", "زبان رابط / Interface language"),
+                BotCommand("help", "راهنما / Help"),
+                BotCommand("stop", "خاموش کردن حالت AI / Turn off AI mode"),
+            ]
+        )
+    except Exception as e:
+        print(f"[startup] failed to set command menu: {e}")
 
 
 # ---------------------- MAIN ----------------------
@@ -2502,6 +4051,7 @@ if __name__ == "__main__":
         .token(TOKEN)
         .request(request)
         .get_updates_request(get_updates_request)
+        .post_init(on_startup)
         .build()
     )
 
@@ -2515,10 +4065,28 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("lang", language_command))  # short alias
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("images", images_command))
+    app.add_handler(CommandHandler("image", images_command))  # alias
+    app.add_handler(CommandHandler("personality", personality_command))
+    app.add_handler(CommandHandler("remind", remind_command))
+    app.add_handler(CommandHandler("reminders", reminders_command))
+    app.add_handler(CommandHandler("forgetpdf", forget_pdf_command))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_error_handler(error_handler)
+
+    # Let background helpers (the AI's set_reminder tool, job callbacks) reach
+    # the running application without passing it through every call.
+    BOT_APP = app
+
+    if app.job_queue is None:
+        print(
+            "[reminders] JobQueue is not available - reminders are disabled. "
+            "Install it with: pip install \"python-telegram-bot[job-queue]\""
+        )
 
     # group=-1 runs before every other handler above, on every update that
     # has an effective_user - this is what feeds real numbers to the admin
