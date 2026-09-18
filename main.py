@@ -70,17 +70,61 @@ def is_owner(update: Update) -> bool:
     return OWNER_TELEGRAM_ID is not None and user is not None and user.id == OWNER_TELEGRAM_ID
 
 
-# ---------------------- ADMIN PANEL: LIGHTWEIGHT STATS/USER STORE ----------------------
-# A single JSON file instead of a real database - this is a personal bot
-# with one admin, not something that needs Postgres. It survives normal
-# process restarts. Note: on hosts with an ephemeral filesystem (e.g. a
-# fresh Render deploy), this file can reset - if you need it to survive
-# deploys too, mount a persistent disk and point STATS_FILE at it.
-STATS_FILE = Path(__file__).parent / "bot_stats.json"
+# ---------------------- ADMIN PANEL: STATS/USER STORE (Upstash Redis) ----------------------
+# Render's free plan wipes local disk on every deploy, so bot_stats.json
+# doesn't actually survive updates there. Upstash Redis is a free, external
+# key-value store - we save/load one JSON blob to/from it over its REST API
+# (just plain HTTP, using the `requests` library already imported above), so
+# the data lives outside Render entirely and survives redeploys.
+#
+# Set these two in your .env locally / Render's Environment tab (from your
+# Upstash database's "REST API" section):
+#   UPSTASH_REDIS_REST_URL
+#   UPSTASH_REDIS_REST_TOKEN
+#
+# If they're not set (e.g. you haven't set Upstash up yet), the bot falls
+# back to the old local JSON file so nothing breaks - it just won't survive
+# a Render redeploy until you add those two variables.
+UPSTASH_REDIS_REST_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_REDIS_REST_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+STATS_REDIS_KEY = "bot_stats"
+STATS_FILE = Path(__file__).parent / "bot_stats.json"  # fallback only, see note above
 _stats_lock = threading.Lock()
+
+if not (UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN):
+    print(
+        "[stats] UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN not set - "
+        "falling back to a local JSON file, which will NOT survive a Render "
+        "redeploy. Add those two env vars to fix this."
+    )
+
+
+def _upstash_command(*command_parts) -> dict:
+    """Run one Redis command against Upstash's REST API. Blocking (uses
+    `requests`) - callers on the event loop should wrap this in
+    asyncio.to_thread so it doesn't stall the bot while the network call is
+    in flight."""
+    resp = requests.post(
+        UPSTASH_REDIS_REST_URL,
+        headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
+        json=list(command_parts),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def _load_stats() -> dict:
+    if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+        try:
+            result = _upstash_command("GET", STATS_REDIS_KEY).get("result")
+            if result:
+                return json.loads(result)
+        except Exception as e:
+            print(f"[stats] failed to load from Upstash, starting fresh: {e}")
+        return {"users": {}, "total_messages": 0, "maintenance": False}
+
+    # Fallback: local file (only survives plain restarts, not redeploys)
     if STATS_FILE.exists():
         try:
             return json.loads(STATS_FILE.read_text(encoding="utf-8"))
@@ -90,11 +134,19 @@ def _load_stats() -> dict:
 
 
 def _save_stats() -> None:
-    try:
-        with _stats_lock:
+    with _stats_lock:
+        if UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN:
+            try:
+                _upstash_command("SET", STATS_REDIS_KEY, json.dumps(BOT_STATS, ensure_ascii=False))
+                return
+            except Exception as e:
+                print(f"[stats] failed to save to Upstash: {e}")
+                return
+        # Fallback: local file
+        try:
             STATS_FILE.write_text(json.dumps(BOT_STATS, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"[stats] failed to save: {e}")
+        except Exception as e:
+            print(f"[stats] failed to save: {e}")
 
 
 BOT_STATS = _load_stats()
@@ -106,8 +158,11 @@ BOT_BOOTED_AT = datetime.now(ZoneInfo("UTC"))
 
 def record_user_activity(update: Update) -> None:
     """Called on every incoming update (group=-1, before any other handler)
-    so the admin panel has real numbers to show. Cheap and best-effort -
-    never allowed to break the actual message handling."""
+    so the admin panel has real numbers to show. Only updates BOT_STATS in
+    memory - saving it (a network call now, with Upstash) is the caller's
+    job via asyncio.to_thread, so this stays fast and never blocks the
+    event loop. Best-effort - never allowed to break the actual message
+    handling."""
     try:
         user = update.effective_user
         if user is None:
@@ -120,13 +175,16 @@ def record_user_activity(update: Update) -> None:
         entry["last_seen"] = now
         entry["message_count"] = entry.get("message_count", 0) + 1
         BOT_STATS["total_messages"] = BOT_STATS.get("total_messages", 0) + 1
-        _save_stats()
     except Exception as e:
         print(f"[stats] record_user_activity failed: {e}")
 
 
 async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     record_user_activity(update)
+    # _save_stats() now does a network call (Upstash) instead of a local
+    # disk write, so it's pushed to a thread to avoid blocking the bot
+    # while it waits on that request.
+    await asyncio.to_thread(_save_stats)
 
 
 def _format_duration(delta) -> str:
@@ -2102,7 +2160,7 @@ async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif data == "admin_maintenance_toggle":
         BOT_STATS["maintenance"] = not BOT_STATS.get("maintenance", False)
-        _save_stats()
+        await asyncio.to_thread(_save_stats)
         state_text = (
             "روشنه 🛑 (بقیه‌ی کاربرا فعلاً نمی‌تونن از ربات استفاده کنن)"
             if BOT_STATS["maintenance"]
